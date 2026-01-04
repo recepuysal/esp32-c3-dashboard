@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-ESP32--C3-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-PlatformIO-orange.svg)
@@ -98,8 +98,16 @@ ESP32-C3 Super Mini ile ST7789 TFT ekran kullanarak gerçek zamanlı veri göste
 
 - **💾 Kalıcı Veri Saklama**
   - Toplam çalışma süresi kalıcı olarak kaydedilir
-  - Cihaz yeniden başlatıldığında toplam süre korunur
   - Preferences API ile güvenli veri saklama
+
+- **🌐 WiFiManager + Captive Portal**
+  - Kod değişikliği olmadan WiFi yapılandırması
+  - Web tabanlı yapılandırma arayüzü
+  - Otomatik Access Point (AP) modu
+  - Captive portal desteği
+  - Mobil uyumlu arayüz
+  - WiFi ayarlarını sıfırlama özelliği
+  - Onay ekranı ile güvenli sıfırlama
 
 - **💤 Ekran Koruyucu (Screen Saver)**
   - 1 dakika hareketsizlik sonrası otomatik devreye girer
@@ -335,13 +343,19 @@ const char* otaPass = "1234";  // Güvenlik için değiştirin!
 ### İlk Çalıştırma
 
 1. Donanım bağlantılarını yapın (Pin Bağlantıları bölümüne bakın)
-2. WiFi bilgilerini yapılandırın
-3. Kodu derleyip ESP32'ye yükleyin
-4. ESP32 açıldığında:
+2. Kodu derleyip ESP32'ye yükleyin (WiFi bilgileri kod içinde değil!)
+3. ESP32 açıldığında:
    - Splash ekranı gösterilir (3 saniye)
-   - WiFi'ye bağlanır
-   - NTP'den zaman alınır
-   - Dashboard ekranı görüntülenir
+   - Eğer WiFi bilgisi yoksa, Access Point (AP) modu açılır
+   - Ekranda WiFi yapılandırma bilgileri gösterilir
+4. **WiFi Yapılandırması (Yeni!):**
+   - Telefon/tablet WiFi listesinde "ESP32-Dashboard-Setup" ağını bulun
+   - Şifre: `1234`
+   - Tarayıcıda `http://192.168.4.1` adresini açın (captive portal otomatik açılabilir)
+   - WiFi ağ adınızı (SSID) ve şifrenizi girin
+   - "WiFi'ye Bağlan" butonuna tıklayın
+   - ESP32 otomatik olarak yeniden başlar ve WiFi'ye bağlanır
+5. Dashboard ekranı görüntülenir
 
 ### OTA Güncelleme
 
@@ -664,11 +678,17 @@ Katkılarınızı bekliyoruz! Lütfen:
 
 ## 📝 Versiyon Geçmişi
 
-### v1.2.1 (Mevcut)
-- ✅ İstatistikler sayfası eklendi (Ortalama, Min/Max, Uptime, WiFi bağlantı süresi)
-- ✅ Sistem bilgileri sayfası eklendi (CPU, Bellek, Chip ID, Firmware, Uptime)
-- ✅ Menüden ana sayfaya dönerken gecikme sorunu düzeltildi
-- ✅ İstatistikler sayfasında sürelerin canlı güncellenmesi sağlandı
+### v1.4.0 (Mevcut)
+- 🌐 WiFiManager + Captive Portal entegrasyonu
+- 📱 Web tabanlı WiFi yapılandırması (kod değişikliği gerekmez!)
+- 🔄 WiFi ayarlarını sıfırlama özelliği
+- ✅ Güvenli onay ekranı
+- 📋 Gelişmiş menü sistemi (kaydırma özelliği)
+
+### v1.3.0
+- ✅ Kalıcı toplam çalışma süresi
+- ✅ Ekran koruyucu (Screen Saver)
+- ✅ Deep Sleep modu
 
 ### v1.2.0
 - ✅ Rotary encoder desteği eklendi

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2024-12-XX
+
+### Added
+- 🌐 **WiFiManager + Captive Portal Entegrasyonu**
+  - Kod değişikliği olmadan WiFi yapılandırması
+  - WiFiManager kütüphanesi entegrasyonu
+  - Web tabanlı yapılandırma arayüzü
+  - Otomatik Access Point (AP) modu ("ESP32-Dashboard-Setup")
+  - Captive portal desteği (otomatik web sayfası açılması)
+  - Mobil uyumlu HTML form arayüzü
+  - Türkçe karakter desteği
+  - WiFi bilgileri Preferences API ile güvenli saklanır
+
+- 🔄 **WiFi Ayarlarını Sıfırlama Özelliği**
+  - Menüden "WiFi Sifirla" seçeneği
+  - Güvenli onay ekranı ("Emin misiniz?")
+  - Evet/Hayır seçenekleri ile encoder kontrolü
+  - WiFi ayarları sıfırlandığında AP modu tekrar açılır
+
+- 📱 **Gelişmiş Menü Sistemi**
+  - Menü kaydırma (scroll) özelliği
+  - WiFi Sifirla en alta taşındı
+  - Otomatik kaydırma ile tüm menü itemları görüntülenir
+  - Scroll göstergesi eklendi
+
+### Changed
+- 🔧 WiFi yapılandırması artık kod içinde değil, web arayüzünden yapılıyor
+- 📋 Menü sıralaması güncellendi: Parlaklik, WiFi Ayarlari, Istatistikler, Sistem Bilgileri, WiFi Sifirla, Geri Don
+- 🎨 Onay ekranı için modern arayüz eklendi
+
+### Technical
+- WiFiManager kütüphanesi eklendi (tzapu/WiFiManager@^0.16.0)
+- WebServer kütüphanesi entegrasyonu
+- HTTP POST endpoint'leri (`/`, `/save`)
+- Preferences API ile WiFi bilgilerinin saklanması
+- Non-blocking web sunucusu yapısı
+- AP modu yönetimi ve durum kontrolü
+
 ## [1.3.0] - 2024-12-XX
 
 ### Added

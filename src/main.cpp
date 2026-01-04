@@ -11,14 +11,18 @@
 #include <Preferences.h>
 #include "esp_sleep.h"
 #include "driver/gpio.h"
+#include <WiFiManager.h>
+#include <WebServer.h>
 
-#define VERSION_TEXT "v1.3.0"   // 🔥 SAG ALTA GÖRÜNECEK VERSİYON
+#define VERSION_TEXT "v1.4.0"   // 🔥 SAG ALTA GÖRÜNECEK VERSİYON
 
 // =====================================================
-// 🔹 Wi-Fi Bilgileri
+// 🔹 Wi-Fi Bilgileri (WiFiManager ile yapılandırılacak)
 // =====================================================
-const char* ssid = "SUPERONLINE_Wi-Fi_8133";
-const char* password = "XdUfXtSXk5NZ";
+// Hard-coded WiFi bilgileri artık kullanılmıyor, 
+// WiFiManager ile kullanıcı ayarlayacak
+const char* ap_ssid = "ESP32-Dashboard-Setup";  // AP modu ağ adı
+const char* ap_password = "1234";           // AP modu şifresi
 
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3 * 3600;
@@ -98,6 +102,12 @@ unsigned long totalUptimeSeconds = 0;  // Kayıtlı toplam çalışma süresi (s
 Preferences prefs;  // Preferences API için
 unsigned long lastUptimeSave = 0;  // Son kayıt zamanı
 const unsigned long uptimeSaveInterval = 60000;  // 60 saniyede bir kaydet
+
+// 🔹 WiFiManager
+WiFiManager wifiManager;
+bool wifiSetupMode = false;  // AP modu aktif mi?
+WebServer server(80);  // Web sunucusu port 80'de
+int wifiResetConfirmItem = 0;  // 0 = Evet, 1 = Hayır
 
 // 🔹 Parlaklık Kontrolü
 int brightness = 128;  // 0-255 arası (varsayılan: %50)
@@ -986,6 +996,65 @@ void showBrightnessMenu(bool reset = false) {
 }
 
 // =======================================================
+// 🟦 WIFI SIFIRLA ONAY EKRANI
+// =======================================================
+void showWiFiResetConfirm() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(40, 30);
+  tft.println("EMIN MISINIZ?");
+  
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(20, 65);
+  tft.println("Tum WiFi bilgileri");
+  tft.setCursor(20, 80);
+  tft.println("silinecek!");
+  
+  // Evet/Hayır seçenekleri
+  String options[] = {"EVET", "HAYIR"};
+  for (int i = 0; i < 2; i++) {
+    if (i == wifiResetConfirmItem) {
+      // Seçili item
+      tft.fillRect(15, 110 + (i * 30), TFT_WIDTH - 30, 28, ST77XX_CYAN);
+      tft.setTextColor(ST77XX_BLACK);
+    } else {
+      tft.setTextColor(ST77XX_WHITE);
+    }
+    tft.setTextSize(2);
+    tft.setCursor((TFT_WIDTH / 2) - 30, 118 + (i * 30));
+    tft.println(options[i]);
+  }
+}
+
+// =======================================================
+// 🟦 WIFI AYARLARINI SIFIRLA
+// =======================================================
+void resetWiFiConfig() {
+  // WiFi ayarlarını sıfırla
+  prefs.begin("wifi", false);
+  prefs.clear();
+  prefs.end();
+  
+  wifiManager.resetSettings();
+  
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(30, 70);
+  tft.println("SIFIRLANDI");
+  
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(20, 100);
+  tft.println("Yeniden baslatiliyor...");
+  
+  delay(2000);
+  ESP.restart();
+}
+
+// =======================================================
 // 🟦 AYARLAR MENÜSÜ
 // =======================================================
 void showSettingsMenu() {
@@ -1001,19 +1070,38 @@ void showSettingsMenu() {
     "WiFi Ayarlari",
     "Istatistikler",
     "Sistem Bilgileri",
+    "WiFi Sifirla",
     "Geri Don"
   };
   
-  for (int i = 0; i < 5; i++) {
+  // Menü kaydırma - eğer menuItem 5 veya 6 ise (WiFi Sifirla veya Geri Don) kaydır
+  int startIndex = 0;
+  if (menuItem >= 4) {
+    startIndex = menuItem - 3;  // En fazla 4 item göster, seçili item ortada olsun
+    if (startIndex > 2) startIndex = 2;  // En fazla 2 item yukarıdan kaydır
+  }
+  
+  // Ekranda gösterilecek item sayısı (maksimum 4 item)
+  int visibleItems = 4;
+  int endIndex = startIndex + visibleItems;
+  if (endIndex > 6) endIndex = 6;
+  
+  for (int i = startIndex; i < endIndex; i++) {
+    int displayIndex = i - startIndex;
     if (i == menuItem) {
       // Seçili item: CYAN arka plan, WHITE text (ana sayfa uyumlu)
-      tft.fillRect(15, 38 + (i * 25), TFT_WIDTH - 30, 22, ST77XX_CYAN);
+      tft.fillRect(15, 38 + (displayIndex * 25), TFT_WIDTH - 30, 22, ST77XX_CYAN);
       tft.setTextColor(ST77XX_BLACK);
     } else {
       tft.setTextColor(ST77XX_WHITE);
     }
-    tft.setCursor(20, 40 + (i * 25));
+    tft.setCursor(20, 40 + (displayIndex * 25));
     tft.println(menuItems[i]);
+  }
+  
+  // Scroll göstergesi (eğer kaydırma varsa)
+  if (startIndex > 0 || endIndex < 6) {
+    tft.fillCircle(TFT_WIDTH - 10, 15, 3, ST77XX_WHITE);
   }
 }
 
@@ -1180,8 +1268,14 @@ void handleEncoderNavigation() {
       // Ayarlar menüsünde item seçimi
       menuItem += diff;
       if (menuItem < 0) menuItem = 0;
-      if (menuItem > 4) menuItem = 4;
+      if (menuItem > 5) menuItem = 5;  // 6 item var (0-5): Parlaklik, WiFi Ayarlari, Istatistikler, Sistem Bilgileri, WiFi Sifirla, Geri Don
       showSettingsMenu();
+    } else if (currentMenuPage == 6) {
+      // WiFi Sıfırla onay ekranı
+      wifiResetConfirmItem += diff;
+      if (wifiResetConfirmItem < 0) wifiResetConfirmItem = 0;
+      if (wifiResetConfirmItem > 1) wifiResetConfirmItem = 1;
+      showWiFiResetConfirm();
     } else if (currentMenuPage == 2) {
       // Parlaklık ayarı menüsünde
       brightness += diff * 5;  // Her adımda 5 artır/azalt
@@ -1231,6 +1325,10 @@ void handleEncoderNavigation() {
         showSystemInfoMenu(true);  // Reset
         showSystemInfoMenu();      // İlk çizim
       } else if (menuItem == 4) {
+        // "WiFi Sifirla" seçildi - Onay ekranına geç
+        currentMenuPage = 6;  // Onay ekranı sayfası
+        showWiFiResetConfirm();
+      } else if (menuItem == 5) {
         // "Geri Don" seçildi - ana sayfaya dön
         currentMenuPage = 0;
         tft.fillScreen(ST77XX_BLACK);
@@ -1275,15 +1373,27 @@ void handleEncoderNavigation() {
     } else if (currentMenuPage == 4) {
       // İstatistikler sayfasından ayarlar menüsüne geri dön
       currentMenuPage = 1;
-      menuItem = 2;  // Istatistikler seçili kalsın
+      menuItem = 2;  // Istatistikler seçili kalsın (index 2)
       showStatisticsMenu(true);  // Reset
       showSettingsMenu();
     } else if (currentMenuPage == 5) {
       // Sistem bilgileri sayfasından ayarlar menüsüne geri dön
       currentMenuPage = 1;
-      menuItem = 3;  // Sistem Bilgileri seçili kalsın
+      menuItem = 3;  // Sistem Bilgileri seçili kalsın (index 3)
       showSystemInfoMenu(true);  // Reset
       showSettingsMenu();
+    } else if (currentMenuPage == 6) {
+      // WiFi Sıfırla onay ekranında buton basıldı
+      if (wifiResetConfirmItem == 0) {
+        // EVET seçildi - WiFi'yi sıfırla
+        resetWiFiConfig();
+      } else {
+        // HAYIR seçildi - menüye dön
+        currentMenuPage = 1;
+        menuItem = 4;  // WiFi Sifirla seçili kalsın
+        wifiResetConfirmItem = 0;  // Reset
+        showSettingsMenu();
+      }
     }
   }
 }
@@ -1349,6 +1459,11 @@ void updateTimeIfNeeded() {
 // 🟦 WIFI DURUM KONTROLÜ VE YENİDEN BAĞLANMA (Non-blocking)
 // =======================================================
 void checkWiFiConnection() {
+  // WiFiManager AP modunda çalışıyorsa kontrol etme
+  if (wifiSetupMode) {
+    return;
+  }
+  
   unsigned long now = millis();
   
   // Her 10 saniyede bir kontrol et (CPU'yu yormaz)
@@ -1370,13 +1485,28 @@ void checkWiFiConnection() {
         
         Serial.print("WiFi yeniden baglanma denemesi... ");
         
-        // WiFi'yi durdur ve yeniden başlat (hızlı, blocking değil)
-        WiFi.disconnect();
-        delay(100);  // Kısa delay, blocking değil
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(ssid, password);
+        // Preferences'dan WiFi bilgilerini oku
+        prefs.begin("wifi", true);
+        String savedSSID = prefs.getString("ssid", "");
+        String savedPass = prefs.getString("pass", "");
+        prefs.end();
         
-        Serial.println("baslatildi (non-blocking)");
+        if (savedSSID.length() > 0 && savedPass.length() > 0) {
+          // WiFi'yi durdur ve yeniden başlat (hızlı, blocking değil)
+          WiFi.disconnect();
+          delay(100);  // Kısa delay, blocking değil
+          WiFi.mode(WIFI_STA);
+          WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+          
+          Serial.println("baslatildi (non-blocking)");
+        } else {
+          Serial.println("Kayitli WiFi bilgisi yok, WiFiManager aciliyor...");
+          // WiFi bilgisi yoksa veya şifre yoksa WiFiManager'ı başlat
+          wifiSetupMode = true;
+          WiFi.disconnect();
+          delay(100);
+          // WiFiManager loop() içinde handle edilecek
+        }
       }
     } else {
       // Bağlantı var
@@ -1409,36 +1539,269 @@ void checkWiFiConnection() {
 }
 
 // =======================================================
-void connectWiFiAndNTP() {
-
-  Serial.print("Wifi baglaniyor: ");
-  Serial.println(ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(300);
-  }
-
-  Serial.println("\nWiFi BAGLANDI!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  ipAddress = WiFi.localIP().toString();
+// 🟦 WIFI BİLGİLERİNİ PREFERENCES'DAN YÜKLE
+// =======================================================
+bool loadWiFiCredentials() {
+  prefs.begin("wifi", true);  // Read-only mode
+  String savedSSID = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
+  prefs.end();
   
-  // WiFi bağlantı zamanını kaydet
-  wifiConnectedTime = millis();
-  wifiWasConnected = true;
-
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
-  struct tm timeinfo;
-  while (!getLocalTime(&timeinfo)) {
-    Serial.println("NTP alinamadi...");
-    delay(500);
+  if (savedSSID.length() > 0) {
+    Serial.print("Kayitli WiFi bilgisi bulundu: ");
+    Serial.println(savedSSID);
+    return true;
   }
+  return false;
+}
+
+// =======================================================
+// 🟦 WEB SUNUCUSU HANDLER FONKSİYONLARI
+// =======================================================
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>ESP32 WiFi Ayarları</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; background: #f5f5f5; }";
+  html += "h1 { color: #333; text-align: center; }";
+  html += ".form-group { margin: 20px 0; }";
+  html += "label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }";
+  html += "input[type='text'], input[type='password'] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 16px; }";
+  html += "button { width: 100%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; margin-top: 10px; }";
+  html += "button:hover { background: #45a049; }";
+  html += ".info { background: #e3f2fd; padding: 15px; border-radius: 4px; margin-bottom: 20px; }";
+  html += "</style></head><body>";
+  html += "<h1>📶 ESP32 WiFi Yapılandırma</h1>";
+  html += "<div class='info'>";
+  html += "<strong>Talimatlar:</strong><br>";
+  html += "1. Aşağıdaki listeden WiFi ağınızı seçin<br>";
+  html += "2. WiFi şifrenizi girin<br>";
+  html += "3. 'Bağlan' butonuna tıklayın<br>";
+  html += "ESP32 otomatik olarak yeniden başlayacak ve WiFi'ye bağlanacak.";
+  html += "</div>";
+  html += "<form action='/save' method='POST'>";
+  html += "<div class='form-group'>";
+  html += "<label for='ssid'>WiFi Ağ Adı (SSID):</label>";
+  html += "<input type='text' id='ssid' name='ssid' required placeholder='WiFi ağ adını girin'>";
+  html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label for='pass'>WiFi Şifresi:</label>";
+  html += "<input type='password' id='pass' name='pass' required placeholder='WiFi şifresini girin'>";
+  html += "</div>";
+  html += "<button type='submit'>🔗 WiFi'ye Bağlan</button>";
+  html += "</form>";
+  html += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleSave() {
+  if (server.hasArg("ssid") && server.hasArg("pass")) {
+    String ssid = server.arg("ssid");
+    String pass = server.arg("pass");
+    
+    Serial.println("WiFi bilgileri alindi:");
+    Serial.print("SSID: ");
+    Serial.println(ssid);
+    Serial.print("Password: ");
+    Serial.println(pass);
+    
+    // WiFi bilgilerini Preferences'a kaydet
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    
+    // WiFiManager'a da kaydet
+    wifiManager.setSTAStaticIPConfig(IPAddress(), IPAddress(), IPAddress());
+    
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>WiFi Ayarları Kaydedildi</title>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; text-align: center; }";
+    html += "h1 { color: #4CAF50; }";
+    html += ".success { background: #d4edda; padding: 20px; border-radius: 4px; margin: 20px 0; }";
+    html += "</style></head><body>";
+    html += "<h1>✅ WiFi Ayarları Kaydedildi!</h1>";
+    html += "<div class='success'>";
+    html += "<p><strong>SSID:</strong> " + ssid + "</p>";
+    html += "<p>ESP32 şimdi yeniden başlatılıyor ve WiFi'ye bağlanıyor...</p>";
+    html += "<p>Bu sayfayı kapatabilirsiniz.</p>";
+    html += "</div>";
+    html += "</body></html>";
+    server.send(200, "text/html; charset=utf-8", html);
+    
+    delay(2000);  // Kullanıcıya mesajı görmesi için zaman ver
+    
+    // WiFi'ye bağlanmayı dene
+    Serial.println("WiFi'ye baglaniliyor...");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi BAGLANDI!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      
+      // NTP yapılandırması
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      
+      // ESP32'yi yeniden başlat (normal moda geçmek için)
+      delay(1000);
+      ESP.restart();
+    } else {
+      Serial.println("\nBaglanamadi! ESP32 yeniden baslatiliyor...");
+      delay(2000);
+      ESP.restart();
+    }
+  } else {
+    server.send(400, "text/plain", "Hata: SSID ve şifre gerekli!");
+  }
+}
+
+// =======================================================
+// 🟦 WIFI MANAGER İLE BAĞLANTI
+// =======================================================
+void connectWiFiAndNTP() {
+  // Önce kayıtlı WiFi bilgilerini kontrol et
+  prefs.begin("wifi", true);
+  String savedSSID = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
+  prefs.end();
+  
+  // Eğer kayıtlı WiFi bilgisi varsa dene
+  if (savedSSID.length() > 0 && savedPass.length() > 0) {
+    Serial.print("Kayitli WiFi'ye baglaniliyor: ");
+    Serial.println(savedSSID);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    
+    // 10 saniye bekle (20 x 500ms)
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi BAGLANDI!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      
+      ipAddress = WiFi.localIP().toString();
+      wifiConnectedTime = millis();
+      wifiWasConnected = true;
+      wifiSetupMode = false;
+      
+      // NTP yapılandırması
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      
+      struct tm timeinfo;
+      int ntpAttempts = 0;
+      while (!getLocalTime(&timeinfo) && ntpAttempts < 10) {
+        Serial.println("NTP alinamadi...");
+        delay(500);
+        ntpAttempts++;
+      }
+      
+      return; // Başarılı, normal çalışmaya devam et
+    }
+    
+    Serial.println("\nBaglanamadi, WiFiManager aciliyor...");
+    // Bağlanamadı, AP moduna geç
+  } else {
+    Serial.println("Kayitli WiFi bilgisi yok, WiFiManager aciliyor...");
+  }
+  
+  // WiFi bilgisi yoksa veya bağlanamadıysa WiFiManager'ı başlat
+  wifiSetupMode = true;
+  
+  Serial.println("========================================");
+  Serial.println("WiFiManager AP Modu baslatiliyor...");
+  Serial.println("AP Ag Adi: " + String(ap_ssid));
+  Serial.println("AP Sifresi: " + String(ap_password));
+  Serial.println("AP IP: 192.168.4.1");
+  Serial.println("========================================");
+  
+  // WiFi'yi temizle
+  WiFi.disconnect();
+  delay(500);
+  
+  // Ekranda bilgilendirme göster
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(20, 20);
+  tft.println("WiFi AYARLARI");
+  
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 50);
+  tft.println("Ag adi:");
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(10, 65);
+  tft.println(ap_ssid);
+  
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 85);
+  tft.println("Sifre:");
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(10, 100);
+  tft.println(ap_password);
+  
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 125);
+  tft.println("Telefonunuzdan baglanip");
+  tft.setCursor(10, 140);
+  tft.println("ayarlari yapiniz");
+  
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(10, 158);
+  tft.println("192.168.4.1");
+  
+  // WiFiManager ayarları
+  wifiManager.setConfigPortalTimeout(180);  // 3 dakika timeout
+  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), 
+                                   IPAddress(192,168,4,1), 
+                                   IPAddress(255,255,255,0));
+  
+  // WiFi'yi açıkça AP moduna geçir
+  WiFi.mode(WIFI_AP_STA);  // Hem AP hem Station modu
+  
+  Serial.println("AP modu aciliyor...");
+  delay(1000);  // AP'nin açılması için bekleme
+  
+  // WiFiManager'ı non-blocking modda başlat
+  // startConfigPortal() web sunucusunu başlatır ama blocking değil
+  Serial.println("========================================");
+  Serial.println("WiFiManager web sunucusu baslatiliyor...");
+  Serial.println("Tarayicida http://192.168.4.1 adresini acin");
+  Serial.println("========================================");
+  
+  // startConfigPortal() web sunucusunu başlatır (non-blocking)
+  wifiManager.startConfigPortal(ap_ssid, ap_password);
+  
+  Serial.println("Web sunucusu baslatildi! http://192.168.4.1");
+  
+  // Web sunucusu route'larını ayarla
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  Serial.println("Web sunucusu route'lari ayarlandi: / ve /save");
+  
+  // WiFi bağlantısı web arayüzünden yapılacak
+  // handleSave() fonksiyonu WiFi bilgilerini kaydedip ESP32'yi yeniden başlatacak
 }
 
 // =======================================================
@@ -1568,6 +1931,58 @@ void setup() {
 
 // =======================================================
 void loop() {
+  // WiFiManager AP modunda çalışıyorsa handle et
+  if (wifiSetupMode) {
+    wifiManager.process();  // WiFiManager isteklerini işle
+    server.handleClient();  // Web sunucusu isteklerini işle
+    
+    // WiFi bağlandı mı kontrol et
+    if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0) {
+      // WiFi bağlandı ama AP modu hala açık
+      // WiFiManager otomatik olarak kapatacak, biraz bekle
+      delay(1000);
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi'ye baglanildi! AP modu kapatiliyor...");
+        wifiSetupMode = false;
+        
+        // WiFi bilgilerini kaydet
+        Preferences wmPrefs;
+        String wifiPass = "";
+        wmPrefs.begin("wifimanager", true);
+        wifiPass = wmPrefs.getString("pwd", "");
+        if (wifiPass.length() == 0) {
+          wifiPass = wmPrefs.getString("password", "");
+        }
+        wmPrefs.end();
+        
+        prefs.begin("wifi", false);
+        prefs.putString("ssid", WiFi.SSID());
+        if (wifiPass.length() > 0) {
+          prefs.putString("pass", wifiPass);
+        }
+        prefs.end();
+        
+        ipAddress = WiFi.localIP().toString();
+        wifiConnectedTime = millis();
+        wifiWasConnected = true;
+        
+        // NTP yapılandırması
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        
+        // Ekranı temizle
+        tft.fillScreen(ST77XX_BLACK);
+        
+        // Web sunucusunu kapat
+        server.stop();
+        
+        return;
+      }
+    }
+    
+    return;  // AP modundayken diğer işlemleri yapma
+  }
+  
   ArduinoOTA.handle();
   
   // Ekran koruyucu kontrolü (en üstte, diğer fonksiyonlardan önce)
