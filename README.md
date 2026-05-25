@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-ESP32--C3-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-PlatformIO-orange.svg)
@@ -678,7 +678,14 @@ Katkılarınızı bekliyoruz! Lütfen:
 
 ## 📝 Versiyon Geçmişi
 
-### v1.4.0 (Mevcut)
+### v1.5.0 (Mevcut)
+- 🔋 Pil seviye ikonları (battery20–100) ve şarj ikonları (charge20–100)
+- ⚡ TP4056 şarj durumu (CHRG/STDBY), tamamlandığında `full` ikonu
+- 📊 Pil Durumu menüsü: şarj metni, pin durumu, ekran ikonu bilgisi
+- 🔧 Pil voltaj kalibrasyonu ve üst çubuk (WiFi + pil) düzeni
+- 📡 PlatformIO OTA ortamı (`esp32c3_super_mini_ota`)
+
+### v1.4.0
 - 🌐 WiFiManager + Captive Portal entegrasyonu
 - 📱 Web tabanlı WiFi yapılandırması (kod değişikliği gerekmez!)
 - 🔄 WiFi ayarlarını sıfırlama özelliği

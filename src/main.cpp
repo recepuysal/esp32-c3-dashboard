@@ -14,7 +14,7 @@
 #include <WiFiManager.h>
 #include <WebServer.h>
 
-#define VERSION_TEXT "v1.4.0"   // 🔥 SAG ALTA GÖRÜNECEK VERSİYON
+#define VERSION_TEXT "v1.5.0"   // 🔥 SAG ALTA GÖRÜNECEK VERSİYON
 
 // =====================================================
 // 🔹 Wi-Fi Bilgileri (WiFiManager ile yapılandırılacak)
@@ -38,6 +38,21 @@ const int daylightOffset_sec = 0;
 // 🔹 DHT11 Pin
 #define DHT_PIN   2   // GPIO2 - DHT11 DATA pini
 
+// 🔹 Batarya ölçümü (LiPo → R1 100k → GPIO0 ← R2 200k → GND)
+#define BAT_ADC_PIN       0
+// Tek nokta kalibrasyon: multimetre pil / ESP analogRead (aynı anda ölçülmeli)
+// İnce ayar: multimetre 4.07V, ekran 4.14V → ESP_ADC *= 4.14/4.07
+#define BAT_CALIB_VBAT        4.07f
+#define BAT_CALIB_ESP_ADC_V   2.803f
+#define BAT_VOLT_SCALE        (BAT_CALIB_VBAT / BAT_CALIB_ESP_ADC_V)
+#define BAT_FULL_V            4.20f
+#define BAT_EMPTY_V           3.00f
+#define BAT_DISPLAY_MAX_V     4.35f
+
+// 🔹 TP4056 (active LOW) — CHRG=şarj, STDBY=şarj tamam
+#define PIN_CHRG   21
+#define PIN_STDBY  20
+
 // 🔹 Encoder Pinleri
 #define ENCODER_CLK   8   // GPIO8 - CLK pini
 #define ENCODER_DT    9   // GPIO9 - DT pini  
@@ -48,9 +63,37 @@ const int daylightOffset_sec = 0;
 #define LEDC_FREQ 5000    // PWM frekansı (Hz)
 #define LEDC_RESOLUTION 8 // 8-bit çözünürlük (0-255)
 #define USE_PWM true      // PWM kullanılsın
+#define BACKLIGHT_LEDC_CHANNEL 0
 
 #define TFT_WIDTH  320
 #define TFT_HEIGHT 172
+
+// Sağ üst: [pil yazısı] [WiFi 17x13] [pil ikonu 40x20]
+#define TOPBAR_MARGIN   6
+#define TOPBAR_GAP      4
+#define BAT_ICON_W      40
+#define BAT_ICON_H      20
+#define WIFI_ICON_W     17
+#define WIFI_ICON_H     13
+
+static int batteryIconX() {
+  return TFT_WIDTH - BAT_ICON_W - TOPBAR_MARGIN;
+}
+
+static int batteryIconY() {
+  return TOPBAR_MARGIN;
+}
+
+static int wifiIconX() {
+  return batteryIconX() - WIFI_ICON_W - TOPBAR_GAP;
+}
+static int wifiIconY() {
+  return batteryIconY() + (BAT_ICON_H - WIFI_ICON_H) / 2;
+}
+
+static int topBarReservedWidth() {
+  return BAT_ICON_W + WIFI_ICON_W + TOPBAR_GAP + TOPBAR_MARGIN + 8;
+}
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 DHT dht(DHT_PIN, DHT11);
@@ -63,7 +106,12 @@ String prevTime = "";
 String prevDate = "";
 String prevTemp = "";
 String prevHum = "";
+String prevBattery = "";
+String prevChargeStatus = "";
+static int lastBatteryPctForIcon = 0;
 String ipAddress = "";
+unsigned long lastBatteryRead = 0;
+const unsigned long batteryReadInterval = 30000;  // 30 saniyede bir ADC oku
 int prevOTAPercent = -1;  // OTA progress takibi için
 
 // 🔹 WiFi Yeniden Bağlanma
@@ -82,7 +130,7 @@ unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 200;  // Debounce süresi artırıldı
 
 // 🔹 Menü Sistemi
-int currentMenuPage = 0;  // 0: Ana sayfa, 1: Ayarlar, 2: Parlaklık, 3: WiFi Bilgileri, 4: İstatistikler, 5: Sistem Bilgileri
+int currentMenuPage = 0;  // 0:Ana 1:Ayarlar 2:Parlaklik 3:WiFi 4:Istatistik 5:Sistem 6:WiFiSifirlaOnay 7:Dil 8:PilDurumu
 int menuItem = 0;
 
 // 🔹 İstatistikler
@@ -109,6 +157,10 @@ bool wifiSetupMode = false;  // AP modu aktif mi?
 WebServer server(80);  // Web sunucusu port 80'de
 int wifiResetConfirmItem = 0;  // 0 = Evet, 1 = Hayır
 
+// 🔹 Dil Sistemi
+int currentLanguage = 0;  // 0 = Türkçe, 1 = İngilizce (varsayılan: Türkçe)
+int languageSelectionItem = 0;  // Dil seçim sayfası için
+
 // 🔹 Parlaklık Kontrolü
 int brightness = 128;  // 0-255 arası (varsayılan: %50)
 const int brightnessMin = 20;
@@ -126,10 +178,41 @@ bool needRedraw = false;  // Ekran koruyucudan çıkınca yeniden çizmek için
 const char* otaName = "sp_dashboard";
 const char* otaPass = "1234";
 
+// İleri bildirimler (PlatformIO .cpp derlemesi için)
+bool isCharging();
+bool isChargeComplete();
+void drawBatteryIcon();
+void updateLogoByRSSI();
+void setBrightness(int level);
+void saveTotalUptime();
+void loadTotalUptime();
+void saveLanguage();
+void loadLanguage();
+String getTitleText(int index);
+String getText(const char* tr, const char* en);
+String getText(const char* tr, const char* en);
+String getMenuText(int index);
+void showBatteryHealthMenu(bool reset = false);
+String getBatteryHealthLabel(int pct, float vBat, uint16_t* colorOut);
+
 // =======================================================
 //  🟦 OTA BAŞLATMA
 // =======================================================
+static bool otaInitialized = false;
+
+void resetOTA() {
+  otaInitialized = false;
+}
+
 void startOTA() {
+  if (otaInitialized) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi bagli degil - OTA baslatilmiyor");
+    return;
+  }
 
   Serial.println("OTA yukleme servisi baslatiliyor...");
 
@@ -139,6 +222,7 @@ void startOTA() {
 
   ArduinoOTA.setHostname(otaName);
   ArduinoOTA.setPassword(otaPass);
+  ArduinoOTA.setRebootOnSuccess(true);
 
   ArduinoOTA
       .onStart([]() {
@@ -211,7 +295,17 @@ void startOTA() {
       });
 
   ArduinoOTA.begin();
-  Serial.println("OTA Hazir!");
+  otaInitialized = true;
+  Serial.println("========================================");
+  Serial.print("OTA hazir | IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Hostname: ");
+  Serial.print(otaName);
+  Serial.println(".local");
+  Serial.print("Sifre: ");
+  Serial.println(otaPass);
+  Serial.println("PlatformIO: env esp32c3_super_mini_ota");
+  Serial.println("========================================");
 }
 
 // =======================================================
@@ -276,6 +370,8 @@ void updateActivity() {
     // Normal parlaklığa geri dön
     brightness = savedBrightness;
     setBrightness(brightness);
+    // Ekranı hemen temizle (ekran koruyucu görüntüsü kalkması için)
+    tft.fillScreen(ST77XX_BLACK);
     needRedraw = true;  // Ekranı yeniden çiz
     Serial.println("Ekran koruyucu devre disi - normal moda donuldu");
   }
@@ -384,7 +480,15 @@ void checkScreenSaver() {
       
       if (screenSaverActiveTime >= deepSleepTimeout) {
         // 5 dakika ekran koruyucuda kaldı - Deep Sleep'e geç
-        enterDeepSleep();
+        // ANCAK: WiFi bağlıyken Deep Sleep'e geçme (OTA güncellemesi yapılabilsin)
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("WiFi bagli - OTA guncellemesi yapilabilir, Deep Sleep geciktirildi");
+          // Aktivite zamanını sıfırla (5 dakika daha bekle)
+          screenSaverStartTime = now;
+        } else {
+          Serial.println("WiFi bagli degil - Deep Sleep'e geciliyor...");
+          enterDeepSleep();
+        }
       }
     }
   }
@@ -412,10 +516,12 @@ void drawTimeAndDate(struct tm &timeinfo) {
   int dateY = 14;
 
   if (curDate != prevDate) {
-    tft.fillRect(0, dateY, TFT_WIDTH, h + 4, ST77XX_BLACK);
+    tft.fillRect(0, dateY, TFT_WIDTH - topBarReservedWidth(), h + 4, ST77XX_BLACK);
     tft.setCursor(dateX, dateY);
     tft.println(curDate);
     prevDate = curDate;
+    drawBatteryIcon();
+    updateLogoByRSSI();
   }
 
   // Saat
@@ -427,10 +533,12 @@ void drawTimeAndDate(struct tm &timeinfo) {
   int timeY = dateY + h + 8;
 
   if (curTime != prevTime) {
-    tft.fillRect(0, timeY, TFT_WIDTH, h + 6, ST77XX_BLACK);
+    tft.fillRect(0, timeY, TFT_WIDTH - topBarReservedWidth(), h + 6, ST77XX_BLACK);
     tft.setCursor(timeX, timeY);
     tft.println(curTime);
     prevTime = curTime;
+    drawBatteryIcon();
+    updateLogoByRSSI();
   }
 }
 
@@ -460,8 +568,8 @@ void drawMenuButton() {
 }
 
 void drawLogo(const unsigned char *bitmap, int w, int h) {
-  int x = TFT_WIDTH - w - 12;
-  int y = 10;
+  int x = wifiIconX();
+  int y = wifiIconY();
   tft.fillRect(x, y, w, h, ST77XX_BLACK);
   tft.drawBitmap(x, y, bitmap, w, h, ST77XX_WHITE);
 }
@@ -475,6 +583,35 @@ void updateLogoByRSSI() {
     drawLogo(epd_bitmap_Mid, 17, 13);
   else
     drawLogo(epd_bitmap_Low, 17, 13);
+}
+
+// Pil ikonu: tamam → full | şarj → charge* | normal → battery* (aynı % kovaları)
+const uint16_t* pickBatteryIconBitmap() {
+  if (!isCharging() && isChargeComplete()) {
+    return epd_bitmap_full;
+  }
+
+  int p = lastBatteryPctForIcon;
+  bool charging = isCharging() && !isChargeComplete();
+
+  if (p > 80) {
+    return charging ? epd_bitmap_charge100 : epd_bitmap_battery100;
+  }
+  if (p > 60) {
+    return charging ? epd_bitmap_charge80 : epd_bitmap_battery80;
+  }
+  if (p > 40) {
+    return charging ? epd_bitmap_charge60 : epd_bitmap_battery60;
+  }
+  if (p > 20) {
+    return charging ? epd_bitmap_charge40 : epd_bitmap_battery40;
+  }
+  return charging ? epd_bitmap_charge20 : epd_bitmap_battery20;
+}
+
+void drawBatteryIcon() {
+  tft.fillRect(batteryIconX() - 2, batteryIconY() - 2, BAT_ICON_W + 4, BAT_ICON_H + 4, ST77XX_BLACK);
+  tft.drawRGBBitmap(batteryIconX(), batteryIconY(), pickBatteryIconBitmap(), BAT_ICON_W, BAT_ICON_H);
 }
 
 // =======================================================
@@ -497,6 +634,291 @@ void drawIPAddress() {
     tft.setCursor(x, y);
     tft.println(ipAddress);
   }
+}
+
+// =======================================================
+// 🟦 BATARYA ÖLÇÜMÜ (voltaj bölücü GPIO0)
+// =======================================================
+static float lastBatAdcRawV = 0.0f;
+
+float readBatteryVoltage() {
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+
+  uint32_t sum_mV = 0;
+  const int samples = 32;
+  for (int i = 0; i < samples; i++) {
+    sum_mV += analogReadMilliVolts(BAT_ADC_PIN);
+    delay(2);
+  }
+
+  float v_adc = (sum_mV / (float)samples) / 1000.0f;
+  lastBatAdcRawV = v_adc;
+  float vBat = v_adc * BAT_VOLT_SCALE;
+
+  if (vBat < 0.0f) {
+    vBat = 0.0f;
+  }
+  if (vBat > BAT_DISPLAY_MAX_V) {
+    vBat = BAT_DISPLAY_MAX_V;
+  }
+
+  return vBat;
+}
+
+int batteryPercent(float vBat) {
+  if (vBat >= BAT_FULL_V) return 100;
+  if (vBat <= BAT_EMPTY_V) return 0;
+  return (int)((vBat - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V) * 100.0f);
+}
+
+uint16_t batteryColor(int percent) {
+  if (percent <= 10) return ST77XX_RED;
+  if (percent <= 20) return ST77XX_YELLOW;
+  return ST77XX_GREEN;
+}
+
+bool isCharging() {
+  return digitalRead(PIN_CHRG) == LOW;
+}
+
+bool isChargeComplete() {
+  return digitalRead(PIN_STDBY) == LOW;
+}
+
+String getChargeStatusText() {
+  bool chrg = isCharging();
+  bool done = isChargeComplete();
+
+  if (chrg && !done) {
+    return getText("Sarj oluyor", "Charging");
+  }
+  if (!chrg && done) {
+    return getText("Sarj tamam", "Charge complete");
+  }
+  if (!chrg && !done) {
+    return getText("Sarj yok", "Not charging");
+  }
+  return getText("Sarj hata?", "Charge fault?");
+}
+
+uint16_t getChargeStatusColor() {
+  if (isCharging()) {
+    return ST77XX_YELLOW;
+  }
+  if (isChargeComplete()) {
+    return ST77XX_GREEN;
+  }
+  return ST77XX_WHITE;
+}
+
+void drawChargeStatus() {
+  String status = getChargeStatusText();
+
+  if (status == prevChargeStatus) {
+    return;
+  }
+  prevChargeStatus = status;
+
+  tft.setTextSize(1);
+  tft.setTextColor(getChargeStatusColor());
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(status, 0, 0, &x1, &y1, &w, &h);
+
+  const int x = 6;
+  const int y = 34;  // Nem satirinin alti (bos alan)
+
+  tft.fillRect(x, y, 120, h + 4, ST77XX_BLACK);
+  tft.setCursor(x, y);
+  tft.println(status);
+
+  drawBatteryIcon();
+
+  Serial.print("TP4056 CHRG=");
+  Serial.print(isCharging() ? "1" : "0");
+  Serial.print(" STDBY=");
+  Serial.print(isChargeComplete() ? "1" : "0");
+  Serial.print(" -> ");
+  Serial.println(status);
+}
+
+void drawBattery(bool forceRead = false) {
+  unsigned long now = millis();
+  if (!forceRead && (now - lastBatteryRead < batteryReadInterval)) {
+    return;
+  }
+  lastBatteryRead = now;
+
+  float vBat = readBatteryVoltage();
+  int pct = batteryPercent(vBat);
+  lastBatteryPctForIcon = pct;
+  String batStr = String(pct) + "% " + String(vBat, 2) + "V";
+
+  bool forceDraw = forceRead;
+  if (batStr == prevBattery && !forceDraw) {
+    return;
+  }
+  prevBattery = batStr;
+
+  tft.setTextSize(1);
+  tft.setTextColor(batteryColor(pct));
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(batStr, 0, 0, &x1, &y1, &w, &h);
+
+  int textX = (TFT_WIDTH - w) / 2;
+  int textY = (TFT_HEIGHT - h) / 2;
+
+  drawBatteryIcon();
+
+  tft.fillRect(textX - 4, textY - 2, w + 8, h + 4, ST77XX_BLACK);
+  tft.setCursor(textX, textY);
+  tft.println(batStr);
+
+  Serial.print("Batarya: ");
+  Serial.print(vBat, 2);
+  Serial.print(" V (");
+  Serial.print(pct);
+  Serial.print("%) | ADC ham: ");
+  Serial.print(lastBatAdcRawV, 2);
+  Serial.println(" V");
+}
+
+String getBatteryHealthLabel(int pct, float vBat, uint16_t* colorOut) {
+  if (pct >= 90 || vBat >= 4.05f) {
+    *colorOut = ST77XX_GREEN;
+    return getText("Mukemmel", "Excellent");
+  }
+  if (pct >= 70 || vBat >= 3.90f) {
+    *colorOut = ST77XX_GREEN;
+    return getText("Iyi", "Good");
+  }
+  if (pct >= 40 || vBat >= 3.70f) {
+    *colorOut = ST77XX_YELLOW;
+    return getText("Orta", "Fair");
+  }
+  if (pct >= 15 || vBat >= 3.50f) {
+    *colorOut = ST77XX_YELLOW;
+    return getText("Dusuk", "Low");
+  }
+  *colorOut = ST77XX_RED;
+  return getText("Kritik - Sarj edin", "Critical - Charge");
+}
+
+// Pil durum menusu: ana ekrandaki ikon adi (battery / charge / full)
+static String getBatteryIconMenuLabel(int pct) {
+  if (!isCharging() && isChargeComplete()) {
+    return getText("Ekran ikonu: full (dolu)", "Screen icon: full");
+  }
+  bool charging = isCharging() && !isChargeComplete();
+  int step = 20;
+  if (pct > 80) step = 100;
+  else if (pct > 60) step = 80;
+  else if (pct > 40) step = 60;
+  else if (pct > 20) step = 40;
+
+  if (charging) {
+    return getText("Ekran ikonu: charge", "Screen icon: charge") + String(step);
+  }
+  return getText("Ekran ikonu: battery", "Screen icon: battery") + String(step);
+}
+
+// =======================================================
+// 🟦 PİL DURUMU / SAĞLIĞI SAYFASI
+// =======================================================
+void showBatteryHealthMenu(bool reset) {
+  static bool firstDraw = true;
+  const int lineHeight = 15;
+  int yPos = 32;
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  if (reset) {
+    firstDraw = true;
+    return;
+  }
+
+  unsigned long now = millis();
+  static unsigned long lastUpdate = 0;
+  if (!firstDraw && (now - lastUpdate < 1500)) {
+    return;
+  }
+  lastUpdate = now;
+
+  lastBatteryRead = 0;
+  float vBat = readBatteryVoltage();
+  int pct = batteryPercent(vBat);
+  lastBatteryPctForIcon = pct;
+
+  bool chrg = isCharging();
+  bool done = isChargeComplete();
+  bool charging = chrg && !done;
+
+  uint16_t healthColor;
+  String healthLabel = getBatteryHealthLabel(pct, vBat, &healthColor);
+  String chargeStatus = getChargeStatusText();
+  uint16_t chargeColor = getChargeStatusColor();
+  if (chrg && done) {
+    chargeColor = ST77XX_RED;
+  }
+
+  if (firstDraw) {
+    tft.fillScreen(ST77XX_BLACK);
+    firstDraw = false;
+
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_CYAN);
+    String title = getTitleText(8);
+    tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+    tft.setCursor((TFT_WIDTH - w) / 2, 6);
+    tft.println(title);
+  }
+
+  tft.setTextSize(1);
+  tft.fillRect(6, 28, TFT_WIDTH - 12, TFT_HEIGHT - 42, ST77XX_BLACK);
+
+  auto drawLine = [&](const String& line, uint16_t color) {
+    tft.setTextColor(color);
+    tft.fillRect(8, yPos, TFT_WIDTH - 16, lineHeight, ST77XX_BLACK);
+    tft.setCursor(8, yPos);
+    tft.println(line);
+    yPos += lineHeight;
+  };
+
+  // Sarj durumu (ana bilgi)
+  drawLine(getText("Sarj: ", "Charge: ") + chargeStatus, chargeColor);
+
+  drawLine(String(vBat, 2) + " V | " + String(pct) + "% | " + healthLabel, batteryColor(pct));
+  drawLine(getBatteryIconMenuLabel(pct), ST77XX_CYAN);
+
+  // TP4056 pinleri (L=aktif, H=pasif)
+  String pins = getText("Pin ", "Pin ") +
+                (chrg ? "CHRG-L " : "CHRG-H ") +
+                (done ? "STDBY-L" : "STDBY-H");
+  drawLine(pins, (chrg || done) ? ST77XX_YELLOW : ST77XX_WHITE);
+
+  if (chrg && done) {
+    drawLine(getText("! CHRG+STDBY: baglanti?", "! CHRG+STDBY both?"), ST77XX_RED);
+  } else if (charging) {
+    drawLine(getText("Sarj devam ediyor...", "Charging in progress..."), ST77XX_YELLOW);
+  } else if (done) {
+    drawLine(getText("Pil dolu.", "Battery full."), ST77XX_GREEN);
+  } else if (pct < 20) {
+    drawLine(getText("! Yakinda sarj edin", "! Charge soon"), ST77XX_RED);
+  } else if (pct < 40) {
+    drawLine(getText("Pil seviyesi dusuk", "Battery getting low"), ST77XX_YELLOW);
+  }
+
+  drawLine(getText("LiPo 3.7V | Canli 1.5sn", "LiPo 3.7V | Live 1.5s"), ST77XX_WHITE);
+
+  tft.setTextColor(ST77XX_CYAN);
+  String backText = getText("Buton: geri", "Button: back");
+  tft.getTextBounds(backText, 0, 0, &x1, &y1, &w, &h);
+  tft.fillRect((TFT_WIDTH - w) / 2 - 4, TFT_HEIGHT - 16, w + 8, h + 4, ST77XX_BLACK);
+  tft.setCursor((TFT_WIDTH - w) / 2, TFT_HEIGHT - 14);
+  tft.println(backText);
 }
 
 // =======================================================
@@ -586,7 +1008,7 @@ void showStatisticsMenu(bool reset = false) {
     // Başlık (ortalanmış)
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_CYAN);
-    String title = "ISTATISTIKLER";
+    String title = getTitleText(4);  // "ISTATISTIKLER" / "STATISTICS"
     int16_t x1, y1;
     uint16_t w, h;
     tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
@@ -731,7 +1153,7 @@ void showSystemInfoMenu(bool reset = false) {
   // Başlık (ortalanmış)
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
-  String title = "SISTEM BILGILERI";
+  String title = getTitleText(5);  // "SISTEM BILGILERI" / "SYSTEM INFO"
   int16_t x1, y1;
   uint16_t w, h;
   tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
@@ -790,6 +1212,17 @@ void showSystemInfoMenu(bool reset = false) {
   tft.fillRect(10, yPos, TFT_WIDTH - 20, lineHeight, ST77XX_BLACK);
   tft.setCursor(10, yPos);
   tft.println(uptimeStr);
+  yPos += lineHeight;
+
+  // Batarya
+  float vBat = readBatteryVoltage();
+  int batPct = batteryPercent(vBat);
+  String batStr = "Batarya: " + String(batPct) + "% (" + String(vBat, 2) + " V)";
+  tft.setTextColor(batteryColor(batPct));
+  tft.fillRect(10, yPos, TFT_WIDTH - 20, lineHeight, ST77XX_BLACK);
+  tft.setCursor(10, yPos);
+  tft.println(batStr);
+  tft.setTextColor(ST77XX_WHITE);
   yPos += lineHeight;
   
   // WiFi Durumu
@@ -871,8 +1304,7 @@ void setBrightness(int level) {
   brightness = level;
   
   if (USE_PWM) {
-    // PWM kontrolü (çalışmıyorsa bu kısım atlanır)
-    ledcWrite(TFT_BACKLIGHT, brightness);
+    ledcWrite(BACKLIGHT_LEDC_CHANNEL, brightness);
   } else {
     // Basit açık/kapalı kontrolü
     // %50'nin üzerinde açık, altında kapalı
@@ -920,7 +1352,7 @@ void showBrightnessMenu(bool reset = false) {
     // Başlık (ortalanmış)
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_CYAN);
-    String title = "PARLAKLIK";
+    String title = getTitleText(1);  // "PARLAKLIK" / "BRIGHTNESS"
     int16_t x1, y1;
     uint16_t w, h;
     tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
@@ -996,6 +1428,51 @@ void showBrightnessMenu(bool reset = false) {
 }
 
 // =======================================================
+// 🟦 DİL SEÇİM MENÜSÜ
+// =======================================================
+void showLanguageMenu() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 10);
+  tft.println(getTitleText(2));  // "DIL" / "LANGUAGE"
+  
+  // Dil seçenekleri
+  String languages[] = {
+    getText("Turkce", "Turkish"),
+    getText("Ingilizce", "English")
+  };
+  
+  for (int i = 0; i < 2; i++) {
+    if (i == languageSelectionItem) {
+      // Seçili item
+      tft.fillRect(15, 50 + (i * 40), TFT_WIDTH - 30, 35, ST77XX_CYAN);
+      tft.setTextColor(ST77XX_BLACK);
+    } else {
+      tft.setTextColor(ST77XX_WHITE);
+    }
+    tft.setTextSize(2);
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(languages[i], 0, 0, &x1, &y1, &w, &h);
+    int x = (TFT_WIDTH - w) / 2;
+    tft.setCursor(x, 60 + (i * 40));
+    tft.println(languages[i]);
+  }
+  
+  // Geri dön talimatı
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
+  String backText = getText("Buton ile geri don", "Press button to go back");
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(backText, 0, 0, &x1, &y1, &w, &h);
+  int backX = (TFT_WIDTH - w) / 2;
+  tft.setCursor(backX, TFT_HEIGHT - 15);
+  tft.println(backText);
+}
+
+// =======================================================
 // 🟦 WIFI SIFIRLA ONAY EKRANI
 // =======================================================
 void showWiFiResetConfirm() {
@@ -1003,17 +1480,20 @@ void showWiFiResetConfirm() {
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setCursor(40, 30);
-  tft.println("EMIN MISINIZ?");
+  tft.println(getTitleText(6));  // "EMIN MISINIZ?" / "ARE YOU SURE?"
   
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(20, 65);
-  tft.println("Tum WiFi bilgileri");
+  tft.println(getText("Tum WiFi bilgileri", "All WiFi settings"));
   tft.setCursor(20, 80);
-  tft.println("silinecek!");
+  tft.println(getText("silinecek!", "will be deleted!"));
   
   // Evet/Hayır seçenekleri
-  String options[] = {"EVET", "HAYIR"};
+  String options[] = {
+    getText("EVET", "YES"),
+    getText("HAYIR", "NO")
+  };
   for (int i = 0; i < 2; i++) {
     if (i == wifiResetConfirmItem) {
       // Seçili item
@@ -1023,7 +1503,11 @@ void showWiFiResetConfirm() {
       tft.setTextColor(ST77XX_WHITE);
     }
     tft.setTextSize(2);
-    tft.setCursor((TFT_WIDTH / 2) - 30, 118 + (i * 30));
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(options[i], 0, 0, &x1, &y1, &w, &h);
+    int x = (TFT_WIDTH - w) / 2;
+    tft.setCursor(x, 118 + (i * 30));
     tft.println(options[i]);
   }
 }
@@ -1063,28 +1547,19 @@ void showSettingsMenu() {
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
   tft.setCursor(10, 10);
-  tft.println("AYARLAR");
+  tft.println(getTitleText(0));  // "AYARLAR" / "SETTINGS"
   
-  String menuItems[] = {
-    "Parlaklik",
-    "WiFi Ayarlari",
-    "Istatistikler",
-    "Sistem Bilgileri",
-    "WiFi Sifirla",
-    "Geri Don"
-  };
-  
-  // Menü kaydırma - eğer menuItem 5 veya 6 ise (WiFi Sifirla veya Geri Don) kaydır
+  // Menü kaydırma - eğer menuItem 4 veya üzeri ise kaydır
   int startIndex = 0;
   if (menuItem >= 4) {
     startIndex = menuItem - 3;  // En fazla 4 item göster, seçili item ortada olsun
-    if (startIndex > 2) startIndex = 2;  // En fazla 2 item yukarıdan kaydır
+    if (startIndex > 4) startIndex = 4;  // 8 item, 4 gorunur
   }
   
   // Ekranda gösterilecek item sayısı (maksimum 4 item)
   int visibleItems = 4;
   int endIndex = startIndex + visibleItems;
-  if (endIndex > 6) endIndex = 6;
+  if (endIndex > 8) endIndex = 8;  // 8 item (Pil Durumu eklendi)
   
   for (int i = startIndex; i < endIndex; i++) {
     int displayIndex = i - startIndex;
@@ -1096,11 +1571,11 @@ void showSettingsMenu() {
       tft.setTextColor(ST77XX_WHITE);
     }
     tft.setCursor(20, 40 + (displayIndex * 25));
-    tft.println(menuItems[i]);
+    tft.println(getMenuText(i));
   }
   
   // Scroll göstergesi (eğer kaydırma varsa)
-  if (startIndex > 0 || endIndex < 6) {
+  if (startIndex > 0 || endIndex < 8) {
     tft.fillCircle(TFT_WIDTH - 10, 15, 3, ST77XX_WHITE);
   }
 }
@@ -1128,7 +1603,7 @@ void showWiFiInfoMenu(bool reset = false) {
     // Başlık (ortalanmış)
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_CYAN);
-    String title = "WIFI BILGILERI";
+    String title = getTitleText(3);  // "WIFI BILGILERI" / "WIFI INFO"
     int16_t x1, y1;
     uint16_t w, h;
     tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
@@ -1139,7 +1614,7 @@ void showWiFiInfoMenu(bool reset = false) {
     // Alt kısım - Geri dön talimatı (ortalanmış)
     tft.setTextSize(1);
     tft.setTextColor(ST77XX_CYAN);
-    String backText = "Buton ile geri don";
+    String backText = getText("Buton ile geri don", "Press button to go back");
     tft.getTextBounds(backText, 0, 0, &x1, &y1, &w, &h);
     int backX = (TFT_WIDTH - w) / 2;
     tft.setCursor(backX, TFT_HEIGHT - 15);
@@ -1154,7 +1629,7 @@ void showWiFiInfoMenu(bool reset = false) {
       tft.fillRect(10, 40, TFT_WIDTH - 20, 100, ST77XX_BLACK);
       tft.setTextSize(2);
       tft.setTextColor(ST77XX_RED);
-      String errorText = "BAGLI DEGIL!";
+      String errorText = getText("BAGLI DEGIL!", "NOT CONNECTED!");
       int16_t x1, y1;
       uint16_t w, h;
       tft.getTextBounds(errorText, 0, 0, &x1, &y1, &w, &h);
@@ -1268,7 +1743,7 @@ void handleEncoderNavigation() {
       // Ayarlar menüsünde item seçimi
       menuItem += diff;
       if (menuItem < 0) menuItem = 0;
-      if (menuItem > 5) menuItem = 5;  // 6 item var (0-5): Parlaklik, WiFi Ayarlari, Istatistikler, Sistem Bilgileri, WiFi Sifirla, Geri Don
+      if (menuItem > 7) menuItem = 7;  // 8 item (0-7)
       showSettingsMenu();
     } else if (currentMenuPage == 6) {
       // WiFi Sıfırla onay ekranı
@@ -1276,6 +1751,12 @@ void handleEncoderNavigation() {
       if (wifiResetConfirmItem < 0) wifiResetConfirmItem = 0;
       if (wifiResetConfirmItem > 1) wifiResetConfirmItem = 1;
       showWiFiResetConfirm();
+    } else if (currentMenuPage == 7) {
+      // Dil seçim menüsü
+      languageSelectionItem += diff;
+      if (languageSelectionItem < 0) languageSelectionItem = 0;
+      if (languageSelectionItem > 1) languageSelectionItem = 1;
+      showLanguageMenu();
     } else if (currentMenuPage == 2) {
       // Parlaklık ayarı menüsünde
       brightness += diff * 5;  // Her adımda 5 artır/azalt
@@ -1315,20 +1796,30 @@ void handleEncoderNavigation() {
         showWiFiInfoMenu(true);  // Reset
         showWiFiInfoMenu();      // İlk çizim
       } else if (menuItem == 2) {
+        // "Dil" seçildi - Dil seçim sayfasına geç
+        currentMenuPage = 7;  // Dil seçim sayfası
+        languageSelectionItem = currentLanguage;  // Mevcut dili seçili göster
+        showLanguageMenu();
+      } else if (menuItem == 3) {
         // "Istatistikler" seçildi - İstatistikler sayfasına geç
         currentMenuPage = 4;
         showStatisticsMenu(true);  // Reset
         showStatisticsMenu();      // İlk çizim
-      } else if (menuItem == 3) {
-        // "Sistem Bilgileri" seçildi - Sistem bilgileri sayfasına geç
-        currentMenuPage = 5;
-        showSystemInfoMenu(true);  // Reset
-        showSystemInfoMenu();      // İlk çizim
       } else if (menuItem == 4) {
-        // "WiFi Sifirla" seçildi - Onay ekranına geç
-        currentMenuPage = 6;  // Onay ekranı sayfası
-        showWiFiResetConfirm();
+        // "Pil Durumu" seçildi
+        currentMenuPage = 8;
+        showBatteryHealthMenu(true);
+        showBatteryHealthMenu();
       } else if (menuItem == 5) {
+        // "Sistem Bilgileri" seçildi
+        currentMenuPage = 5;
+        showSystemInfoMenu(true);
+        showSystemInfoMenu();
+      } else if (menuItem == 6) {
+        // "WiFi Sifirla" seçildi
+        currentMenuPage = 6;
+        showWiFiResetConfirm();
+      } else if (menuItem == 7) {
         // "Geri Don" seçildi - ana sayfaya dön
         currentMenuPage = 0;
         tft.fillScreen(ST77XX_BLACK);
@@ -1338,16 +1829,20 @@ void handleEncoderNavigation() {
         prevDate = "";
         prevTemp = "";
         prevHum = "";
+        prevBattery = "";
         
         // lastTimeUpdate'i sıfırla ki hemen güncellensin
         lastTimeUpdate = 0;
+        lastBatteryRead = 0;
         
         // Ana sayfa çizimlerini hemen yeniden çiz
         struct tm timeinfo;
         if (getLocalTime(&timeinfo)) {
           drawTimeAndDate(timeinfo);
-          updateLogoByRSSI();
           drawDHT11Data();
+          drawChargeStatus();
+          drawBattery(true);
+          updateLogoByRSSI();
           drawIPAddress();
           drawMenuButton();     // 🔥 MENÜ BUTONU
           drawVersionText();
@@ -1373,14 +1868,18 @@ void handleEncoderNavigation() {
     } else if (currentMenuPage == 4) {
       // İstatistikler sayfasından ayarlar menüsüne geri dön
       currentMenuPage = 1;
-      menuItem = 2;  // Istatistikler seçili kalsın (index 2)
+      menuItem = 3;  // Istatistikler seçili kalsın (index 3)
       showStatisticsMenu(true);  // Reset
       showSettingsMenu();
     } else if (currentMenuPage == 5) {
-      // Sistem bilgileri sayfasından ayarlar menüsüne geri dön
       currentMenuPage = 1;
-      menuItem = 3;  // Sistem Bilgileri seçili kalsın (index 3)
-      showSystemInfoMenu(true);  // Reset
+      menuItem = 5;
+      showSystemInfoMenu(true);
+      showSettingsMenu();
+    } else if (currentMenuPage == 8) {
+      currentMenuPage = 1;
+      menuItem = 4;
+      showBatteryHealthMenu(true);
       showSettingsMenu();
     } else if (currentMenuPage == 6) {
       // WiFi Sıfırla onay ekranında buton basıldı
@@ -1390,10 +1889,23 @@ void handleEncoderNavigation() {
       } else {
         // HAYIR seçildi - menüye dön
         currentMenuPage = 1;
-        menuItem = 4;  // WiFi Sifirla seçili kalsın
+        menuItem = 6;
         wifiResetConfirmItem = 0;  // Reset
         showSettingsMenu();
       }
+    } else if (currentMenuPage == 7) {
+      // Dil seçim menüsünde buton basıldı
+      // Dil seçiminde butona basıldığında: seçili dili kaydet ve ayarlar menüsüne dön
+      if (languageSelectionItem == 0 || languageSelectionItem == 1) {
+        currentLanguage = languageSelectionItem;
+        saveLanguage();  // Dil tercihini kaydet
+      }
+      
+      // Ayarlar menüsüne dön (dil değişti, menü yeniden çizilecek)
+      currentMenuPage = 1;
+      menuItem = 2;  // Dil seçili kalsın
+      languageSelectionItem = currentLanguage;  // Seçili dili göster
+      showSettingsMenu();
     }
   }
 }
@@ -1413,9 +1925,13 @@ void updateTimeIfNeeded() {
         prevDate = "";
         prevTemp = "";
         prevHum = "";
+        prevBattery = "";
+        prevChargeStatus = "";
         drawTimeAndDate(timeinfo);
-        updateLogoByRSSI();
         drawDHT11Data();
+        drawChargeStatus();
+        drawBattery(true);
+        updateLogoByRSSI();
         drawIPAddress();
         drawMenuButton();
         drawVersionText();
@@ -1436,8 +1952,10 @@ void updateTimeIfNeeded() {
       struct tm timeinfo;
       if (getLocalTime(&timeinfo)) {
         drawTimeAndDate(timeinfo);
-        updateLogoByRSSI();
         drawDHT11Data();      // 🔥 DHT11 VERİLERİNİ GÖSTER
+        drawChargeStatus();
+        drawBattery();
+        updateLogoByRSSI();
         drawIPAddress();
         drawMenuButton();     // 🔥 MENÜ BUTONU
         drawVersionText();   // 🔥 VERSİYON SÜREKLİ GÜNCELLENİR
@@ -1449,8 +1967,9 @@ void updateTimeIfNeeded() {
       // İstatistikler sayfası - güncelle
       showStatisticsMenu();
     } else if (currentMenuPage == 5) {
-      // Sistem bilgileri sayfası - güncelle
       showSystemInfoMenu();
+    } else if (currentMenuPage == 8) {
+      showBatteryHealthMenu();
     }
   }
 }
@@ -1476,6 +1995,7 @@ void checkWiFiConnection() {
         wifiReconnecting = true;
         lastReconnectAttempt = 0;  // Hemen dene
         wifiWasConnected = false;  // Bağlantı koptu
+        resetOTA();
         Serial.println("WiFi baglantisi koptu! Yeniden baglanma baslatiliyor...");
       }
       
@@ -1529,6 +2049,8 @@ void checkWiFiConnection() {
         
         // NTP'yi yeniden yapılandır (hızlı, blocking değil)
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+        startOTA();
         
         // Önceki değerleri sıfırla ki ekran yeniden çizilsin
         prevTime = "";
@@ -1850,6 +2372,99 @@ void loadTotalUptime() {
 }
 
 // =======================================================
+// 🟦 DİL SİSTEMİ - ÇEVİRİ FONKSİYONLARI
+// =======================================================
+String getText(const char* tr, const char* en) {
+  return (currentLanguage == 0) ? String(tr) : String(en);
+}
+
+// Menü item'ları için
+String getMenuText(int index) {
+  const char* menuItemsTR[] = {
+    "Parlaklik",
+    "WiFi Ayarlari",
+    "Dil",
+    "Istatistikler",
+    "Pil Durumu",
+    "Sistem Bilgileri",
+    "WiFi Sifirla",
+    "Geri Don"
+  };
+  const char* menuItemsEN[] = {
+    "Brightness",
+    "WiFi Settings",
+    "Language",
+    "Statistics",
+    "Battery",
+    "System Info",
+    "Reset WiFi",
+    "Back"
+  };
+  
+  if (currentLanguage == 0) {
+    return String(menuItemsTR[index]);
+  } else {
+    return String(menuItemsEN[index]);
+  }
+}
+
+// Sayfa başlıkları için
+String getTitleText(int index) {
+  const char* titlesTR[] = {
+    "AYARLAR",
+    "PARLAKLIK",
+    "DIL",
+    "WIFI BILGILERI",
+    "ISTATISTIKLER",
+    "SISTEM BILGILERI",
+    "EMIN MISINIZ?",
+    "WiFi SIFIRLA",
+    "PIL DURUMU"
+  };
+  const char* titlesEN[] = {
+    "SETTINGS",
+    "BRIGHTNESS",
+    "LANGUAGE",
+    "WIFI INFO",
+    "STATISTICS",
+    "SYSTEM INFO",
+    "ARE YOU SURE?",
+    "RESET WiFi",
+    "BATTERY"
+  };
+  
+  if (currentLanguage == 0) {
+    return String(titlesTR[index]);
+  } else {
+    return String(titlesEN[index]);
+  }
+}
+
+// =======================================================
+// 🟦 DİL TERCİHİNİ YÜKLE
+// =======================================================
+void loadLanguage() {
+  prefs.begin("settings", true);  // Read-only mode
+  currentLanguage = prefs.getInt("language", 0);  // Varsayılan: Türkçe (0)
+  prefs.end();
+  
+  Serial.print("Dil yuklendi: ");
+  Serial.println(currentLanguage == 0 ? "Turkce" : "English");
+}
+
+// =======================================================
+// 🟦 DİL TERCİHİNİ KAYDET
+// =======================================================
+void saveLanguage() {
+  prefs.begin("settings", false);
+  prefs.putInt("language", currentLanguage);
+  prefs.end();
+  
+  Serial.print("Dil kaydedildi: ");
+  Serial.println(currentLanguage == 0 ? "Turkce" : "English");
+}
+
+// =======================================================
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -1874,6 +2489,9 @@ void setup() {
   // Kayıtlı toplam çalışma süresini yükle
   loadTotalUptime();
   
+  // Dil tercihini yükle
+  loadLanguage();
+  
   // Sistem başlangıç zamanını kaydet
   systemStartTime = millis();
 
@@ -1886,6 +2504,11 @@ void setup() {
   // DHT11 başlatma
   dht.begin();
   Serial.println("DHT11 baslatildi!");
+
+  // Batarya ADC (GPIO0, voltaj bölücü)
+  pinMode(BAT_ADC_PIN, INPUT);
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  Serial.println("Batarya olcumu baslatildi (GPIO0)");
 
   // Backlight PWM başlatma
   Serial.print("Backlight pin'i ayarlaniyor: GPIO");
@@ -1902,8 +2525,8 @@ void setup() {
   delay(10);
   
   if (USE_PWM) {
-    // LEDC PWM başlat
-    ledcAttach(TFT_BACKLIGHT, LEDC_FREQ, LEDC_RESOLUTION);
+    ledcSetup(BACKLIGHT_LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
+    ledcAttachPin(TFT_BACKLIGHT, BACKLIGHT_LEDC_CHANNEL);
     delay(10);
     Serial.println("PWM modu aktif - LEDC baslatildi");
   } else {
@@ -1919,11 +2542,21 @@ void setup() {
   // Encoder başlatma
   initEncoder();
 
+  pinMode(PIN_CHRG, INPUT_PULLUP);
+  pinMode(PIN_STDBY, INPUT_PULLUP);
+
   showSplashScreen();
   connectWiFiAndNTP();
 
   drawVersionText();  // Açılışta da yazılsın
-  startOTA();
+  drawChargeStatus();
+  drawBattery(true);  // İlk batarya okuması
+  updateLogoByRSSI();
+
+  // OTA'yı sadece WiFi bağlıysa başlat (startOTA içinde de kontrol var ama burada da kontrol edelim)
+  if (WiFi.status() == WL_CONNECTED) {
+    startOTA();
+  }
   
   // İlk aktivite zamanını kaydet
   lastActivityTime = millis();
@@ -1975,17 +2608,21 @@ void loop() {
         
         // Web sunucusunu kapat
         server.stop();
-        
-        return;
+
+        startOTA();
       }
     }
     
     return;  // AP modundayken diğer işlemleri yapma
   }
   
-  ArduinoOTA.handle();
-  
-  // Ekran koruyucu kontrolü (en üstte, diğer fonksiyonlardan önce)
+  // OTA — ekran koruyucudan once; upload sirasinda da dinlemeli
+  if (WiFi.status() == WL_CONNECTED) {
+    startOTA();
+    ArduinoOTA.handle();
+  }
+
+  // Ekran koruyucu kontrolü
   checkScreenSaver();
   
   updateTimeIfNeeded();

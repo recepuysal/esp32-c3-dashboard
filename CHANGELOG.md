@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-05-24
+
+### Added
+- 🔋 **Pil ikon sistemi (RGB565, 40×20)**
+  - Normal: `battery20`, `battery40`, `battery60`, `battery80`, `battery100` (yüzde kovaları)
+  - Şarj: `charge20` … `charge100` (TP4056 CHRG aktifken)
+  - Tamam: `full` (STDBY aktif, CHRG pasif)
+- ⚡ **TP4056 şarj entegrasyonu**
+  - CHRG → GPIO21, STDBY → GPIO20 (active LOW)
+  - Ana ekranda şarj metni: Sarj oluyor / Sarj tamam / Sarj yok
+- 📊 **Pil Durumu menüsü genişletildi**
+  - Canlı şarj durumu, voltaj, %, sağlık özeti
+  - Ana ekrandaki ikon adı (`battery*` / `charge*` / `full`)
+  - CHRG/STDBY pin durumu (inceleme için)
+- 🔧 Pil ADC kalibrasyon sabitleri (`BAT_CALIB_*`)
+- 📡 PlatformIO `esp32c3_super_mini_ota` ortamı (WiFi OTA)
+
+### Changed
+- Sağ üst çubuk: WiFi ikonu + pil ikonu; tarih/saat çizimi üst bandı silmiyor
+- `drawBatteryIcon()` / `pickBatteryIconBitmap()` ile otomatik ikon seçimi
+- WiFiManager kütüphanesi `^2.0.17`
+
 ## [1.4.0] - 2024-12-XX
 
 ### Added
