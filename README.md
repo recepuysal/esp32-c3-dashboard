@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-PlatformIO-orange.svg)
 ![Arduino](https://img.shields.io/badge/Arduino-Compatible-blue.svg)
-![GitHub](https://img.shields.io/github/stars/serialprint/esp32-c3-dashboard?style=social)
+![GitHub](https://img.shields.io/github/stars/recepuysal/esp32-c3-dashboard?style=social)
 
 **Akıllı Dijital Dashboard Projesi**
 
@@ -260,7 +260,7 @@ pip install platformio
 ### 2. Projeyi Klonlayın
 
 ```bash
-git clone https://github.com/serialprint/esp32-c3-dashboard.git
+git clone https://github.com/recepuysal/esp32-c3-dashboard.git
 cd esp32-c3-dashboard
 ```
 
@@ -737,8 +737,8 @@ Bu proje MIT lisansı altında lisanslanmıştır. Detaylar için `LICENSE` dosy
 
 ## 👤 Yazar
 
-**serialprint**
-- GitHub: [@serialprint](https://github.com/serialprint)
+**Recep UYSAL**
+- GitHub: [@recepuysal](https://github.com/recepuysal)
 
 ---
 
@@ -753,7 +753,7 @@ Bu proje MIT lisansı altında lisanslanmıştır. Detaylar için `LICENSE` dosy
 ## 📞 İletişim
 
 Sorularınız veya önerileriniz için:
-- Issue açın: [GitHub Issues](https://github.com/serialprint/esp32-c3-dashboard/issues)
+- Issue açın: [GitHub Issues](https://github.com/recepuysal/esp32-c3-dashboard/issues)
 
 ---
 
@@ -761,6 +761,6 @@ Sorularınız veya önerileriniz için:
 
 **⭐ Beğendiyseniz yıldız vermeyi unutmayın! ⭐**
 
-Made with ❤️ by serialprint
+Made with ❤️ by [recepuysal](https://github.com/recepuysal)
 
 </div>

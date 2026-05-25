@@ -6,14 +6,14 @@ ESP32-C3 Smart Dashboard projesine katkıda bulunmak istediğiniz için teşekk�
 
 ### 🐛 Hata Bildirimi
 
-1. [Issues](https://github.com/serialprint/esp32-c3-dashboard/issues) sayfasına gidin
+1. [Issues](https://github.com/recepuysal/esp32-c3-dashboard/issues) sayfasına gidin
 2. "New Issue" butonuna tıklayın
 3. Hata başlığını ve detaylarını yazın
 4. Mümkünse ekran görüntüsü veya log ekleyin
 
 ### ✨ Yeni Özellik Önerisi
 
-1. [Issues](https://github.com/serialprint/esp32-c3-dashboard/issues) sayfasına gidin
+1. [Issues](https://github.com/recepuysal/esp32-c3-dashboard/issues) sayfasına gidin
 2. "New Issue" butonuna tıklayın
 3. "Feature Request" etiketi ekleyin
 4. Özelliği detaylı açıklayın
@@ -96,7 +96,7 @@ pio device monitor
 
 ## Sorularınız mı Var?
 
-- Issue açın: [GitHub Issues](https://github.com/serialprint/esp32-c3-dashboard/issues)
+- Issue açın: [GitHub Issues](https://github.com/recepuysal/esp32-c3-dashboard/issues)
 - Detaylı bilgi için README.md dosyasına bakın
 
 ## Teşekkürler! 🙏
