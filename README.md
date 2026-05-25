@@ -30,6 +30,7 @@ ESP32-C3 Super Mini ile ST7789 TFT ekran kullanarak gerçek zamanlı veri göste
 - [Pin Bağlantıları](#-pin-bağlantıları)
 - [Proje Yapısı](#-proje-yapısı)
 - [Özellik Detayları](#-özellik-detayları)
+- [Pil ve Şarj Sistemi](#-pil-ve-şarj-sistemi-v150)
 - [Sorun Giderme](#-sorun-giderme)
 - [Geliştirme](#-geliştirme)
 - [Katkıda Bulunma](#-katkıda-bulunma)
@@ -74,10 +75,21 @@ ESP32-C3 Super Mini ile ST7789 TFT ekran kullanarak gerçek zamanlı veri göste
   - Debounce koruması
 
 - **📱 Menü Sistemi**
-  - Ayarlar menüsü
-  - Parlaklık ayarı sayfası
-  - WiFi bilgileri sayfası
+  - Ayarlar menüsü (kaydırma destekli)
+  - Parlaklık, WiFi bilgileri, dil seçimi
+  - İstatistikler ve sistem bilgileri
+  - **Pil Durumu** sayfası (canlı voltaj, şarj, TP4056 pinleri)
+  - WiFi sıfırlama (onay ekranı)
   - Encoder ile kolay navigasyon
+
+- **🔋 Pil ve Şarj Göstergesi (v1.5.0)**
+  - LiPo voltaj ölçümü (GPIO0, voltaj bölücü)
+  - RGB565 pil ikonları: `battery20` … `battery100`
+  - Şarj ikonları: `charge20` … `charge100` (TP4056 CHRG aktifken)
+  - Şarj tamam ikonu: `full` (STDBY aktif)
+  - Ana ekranda yüzde + voltaj metni
+  - TP4056 CHRG/STDBY durum metni (Sarj oluyor / tamam / yok)
+  - Çoklu ölçüm ADC kalibrasyonu
 
 - **💡 Parlaklık Kontrolü**
   - PWM ile ekran parlaklığı kontrolü
@@ -135,6 +147,18 @@ ESP32-C3 Super Mini ile ST7789 TFT ekran kullanarak gerçek zamanlı veri göste
   - Beyaz renk, 1x boyut
   - Format: "XX.X%"
 
+- **Şarj Durumu** (Sol üst, nem altı)
+  - Sarj oluyor / Sarj tamam / Sarj yok (renkli)
+
+- **Pil İkonu** (Sağ üst, 40×20)
+  - `battery*` (normal), `charge*` (şarj), `full` (tamamlandı)
+
+- **WiFi İkonu** (Sağ üst, pilin solunda)
+  - RSSI'ye göre High / Mid / Low
+
+- **Pil Yüzdesi ve Voltaj** (Orta)
+  - Format: `85% 4.14V` (renk: seviyeye göre)
+
 - **Menü Butonu** (Alt orta)
   - Beyaz renk, 1x boyut
   - "MENU" yazısı
@@ -145,7 +169,7 @@ ESP32-C3 Super Mini ile ST7789 TFT ekran kullanarak gerçek zamanlı veri göste
 
 - **Versiyon Bilgisi** (Sağ alt)
   - Beyaz renk, 1x boyut
-  - Format: "vX.X.X"
+  - Format: `v1.5.0`
 
 ---
 
@@ -161,19 +185,19 @@ ESP32-C3 Super Mini ile ST7789 TFT ekran kullanarak gerçek zamanlı veri göste
 
 </div>
 
-### Ana Ekran
+### Ana Ekran (v1.5.0)
 ```
 ┌─────────────────────────────────┐
-│  25.5 C                          │
-│  60.0%                           │
+│ 25.5C  Sarj oluyor      [WiFi][🔋]│
+│ 60.0%                   charge80 │
 │                                  │
-│     01.01.2024                   │
-│     14:30:45                     │
+│        24.05.2026                │
+│        14:30:45                  │
 │                                  │
+│         85% 4.14V                │
 │                                  │
-│              MENU                │
-│                                  │
-│ 192.168.1.100            v1.2.1  │
+│            MENU                  │
+│ 192.168.1.14              v1.5.0 │
 └─────────────────────────────────┘
 ```
 
@@ -274,23 +298,25 @@ pio pkg install
 
 ### 4. Yapılandırma
 
-`src/main.cpp` dosyasında WiFi bilgilerinizi güncelleyin:
+**WiFi:** İlk kurulumda kod değiştirmeniz gerekmez — cihaz **WiFiManager** captive portal ile ağ seçer (`ESP32-Dashboard-Setup` / şifre `1234`).
 
-```cpp
-const char* ssid = "WiFi_Adiniz";
-const char* password = "WiFi_Sifreniz";
-```
+**OTA IP:** `platformio.ini` → `[env:esp32c3_super_mini_ota]` → `upload_port` değerini cihazınızın IP'si ile güncelleyin.
+
+**Pil kalibrasyonu (isteğe bağlı):** `src/main.cpp` içindeki `BAT_CALIB_VBAT` ve `BAT_CALIB_ESP_ADC_V` değerlerini multimetre ile ayarlayın.
 
 ### 5. Derleme ve Yükleme
 
 ```bash
-# Projeyi derle
+# Derle (varsayılan: OTA ortamı)
 pio run
 
-# ESP32'ye yükle
-pio run -t upload
+# USB ile yükle (COM portunu platformio.ini'de ayarlayın)
+pio run -e esp32c3_super_mini -t upload
 
-# Seri monitörü aç
+# WiFi OTA ile yükle
+pio run -e esp32c3_super_mini_ota -t upload
+
+# Seri monitör
 pio device monitor
 ```
 
@@ -300,12 +326,7 @@ pio device monitor
 
 ### WiFi Ayarları
 
-`src/main.cpp` dosyasında:
-
-```cpp
-const char* ssid = "WiFi_Adiniz";
-const char* password = "WiFi_Sifreniz";
-```
+WiFi SSID/şifre **kodda sabit değil** — ilk açılışta veya **Ayarlar → WiFi Sifirla** sonrası captive portal üzerinden girilir. Bilgiler ESP32 flash'ında (Preferences) saklanır.
 
 ### NTP Ayarları
 
@@ -331,10 +352,39 @@ const char* otaPass = "1234";  // Güvenlik için değiştirin!
 #define TFT_RST   5
 #define TFT_SCLK  4
 #define TFT_MOSI  6
+#define TFT_BACKLIGHT 1
 
-// DHT11 Pin
+// DHT11
 #define DHT_PIN   2
+
+// Pil / TP4056 (v1.5.0)
+#define BAT_ADC_PIN  0
+#define PIN_CHRG     21
+#define PIN_STDBY    20
 ```
+
+### Pil Kalibrasyonu
+
+```cpp
+#define BAT_CALIB_VBAT      4.07f   // Multimetre ile ölçülen pil V
+#define BAT_CALIB_ESP_ADC_V 2.803f   // Aynı anda GPIO0 okuma (V)
+#define BAT_FULL_V          4.20f
+#define BAT_EMPTY_V         3.00f
+```
+
+### OTA (PlatformIO)
+
+`platformio.ini` — varsayılan ortam WiFi OTA:
+
+```ini
+[env:esp32c3_super_mini_ota]
+upload_protocol = espota
+upload_port = 192.168.1.14   ; Cihaz IP'nizi yazın
+upload_flags =
+    --auth=1234
+```
+
+USB yükleme için VS Code alt çubuktan `esp32c3_super_mini` ortamını seçin.
 
 ---
 
@@ -359,11 +409,18 @@ const char* otaPass = "1234";  // Güvenlik için değiştirin!
 
 ### OTA Güncelleme
 
-1. ESP32'yi WiFi'ye bağlayın
-2. Arduino IDE veya PlatformIO'dan OTA yükleme seçeneğini kullanın
-3. Hostname: `sp_dashboard`
-4. Şifre: `1234` (yapılandırmada değiştirdiyseniz onu kullanın)
+1. ESP32'yi WiFi'ye bağlayın (ana ekranda IP adresi görünür)
+2. `platformio.ini` içinde `upload_port` değerini cihaz IP'si ile güncelleyin
+3. PlatformIO: `pio run -t upload -e esp32c3_super_mini_ota`
+4. Hostname: `sp_dashboard` — Şifre: `1234`
 5. Güncelleme sırasında ekranda ilerleme görüntülenir
+
+### Pil Durumu Menüsü
+
+1. Ana ekranda encoder butonuna basın → **MENU**
+2. **Pil Durumu** satırını seçin
+3. Canlı voltaj, şarj durumu, ikon adı ve TP4056 pinlerini izleyin
+4. USB takıp çıkararak / şarj tamamlanırken değişimi gözlemleyin
 
 ### Ekran Koruyucu ve Deep Sleep
 
@@ -454,6 +511,28 @@ ESP32-C3 Super Mini
 
 **Not:** Rotary encoder modülü genellikle dahili pull-up dirençleri içerir. SW pinine harici pull-up direnci gerekebilir.
 
+### Pil Ölçümü ve TP4056 (v1.5.0)
+
+| Sinyal | ESP32-C3 | Açıklama |
+|--------|----------|----------|
+| BAT_ADC | GPIO0 | LiPo voltaj bölücü (R1=100k üst, R2=200k alt → GND) |
+| CHRG | GPIO21 | TP4056 şarj çıkışı (**active LOW** = şarj oluyor) |
+| STDBY | GPIO20 | TP4056 tamam çıkışı (**active LOW** = şarj tamam) |
+
+**Voltaj bölücü (örnek):**
+```
+LiPo+ ── R1 100k ── GPIO0 ── R2 200k ── GND
+```
+
+**TP4056 mantığı (yazılımda):**
+
+| CHRG | STDBY | Anlam | Ekran ikonu |
+|------|-------|--------|-------------|
+| LOW | HIGH | Şarj oluyor | `charge20`…`charge100` |
+| HIGH | LOW | Şarj tamam | `full` |
+| HIGH | HIGH | Şarj yok | `battery20`…`battery100` |
+| LOW | LOW | Hata / bağlantı? | Uyarı metni |
+
 ### Güç Yönetimi Bağlantı Şeması
 
 **Batarya Güç Sistemi:**
@@ -492,6 +571,9 @@ GPIO2     ───────────────────────�
 GPIO8     ──────────────────────────────────────── CLK
 GPIO9     ──────────────────────────────────────── DT
 GPIO3     ──────────────────────────────────────── SW
+GPIO0     ──── Batarya ADC (voltaj bölücü)
+GPIO20    ──── TP4056 STDBY
+GPIO21    ──── TP4056 CHRG
 ```
 
 ---
@@ -502,8 +584,8 @@ GPIO3     ───────────────────────�
 esp32-c3-dashboard/
 │
 ├── src/
-│   ├── main.cpp          # Ana program dosyası
-│   └── logo.h           # Logo bitmap verileri
+│   ├── main.cpp          # Ana program, menüler, pil/şarj mantığı
+│   └── logo.h            # WiFi ikonları, pil/şarj bitmap'leri (RGB565)
 │
 ├── include/             # Header dosyaları (boş)
 ├── lib/                 # Kütüphaneler (boş)
@@ -516,9 +598,9 @@ esp32-c3-dashboard/
 
 ### Dosya Açıklamaları
 
-- **`src/main.cpp`**: Ana program kodu, tüm fonksiyonlar ve loop
-- **`src/logo.h`**: WiFi sinyal ikonları ve splash ekran bitmap'leri
-- **`platformio.ini`**: PlatformIO yapılandırması, kütüphaneler ve build ayarları
+- **`src/main.cpp`**: Ana program, `pickBatteryIconBitmap()`, TP4056, menüler
+- **`src/logo.h`**: `battery*`, `charge*`, `full`, WiFi ve splash bitmap'leri
+- **`platformio.ini`**: USB (`esp32c3_super_mini`) ve WiFi OTA (`esp32c3_super_mini_ota`) ortamları
 
 ---
 
@@ -545,6 +627,57 @@ Sinyal gücüne göre dinamik ikonlar:
 - **Yüksek** (≥ -60 dBm): Tam sinyal ikonu
 - **Orta** (-60 to -80 dBm): Orta sinyal ikonu
 - **Düşük** (< -80 dBm): Düşük sinyal ikonu
+
+---
+
+## 🔋 Pil ve Şarj Sistemi (v1.5.0)
+
+### İkon seçim mantığı
+
+Yazılım her güncellemede `pickBatteryIconBitmap()` ile tek bir 40×20 ikon seçer:
+
+```
+1) STDBY=LOW ve CHRG=HIGH  →  full (şarj tamamlandı)
+2) CHRG=LOW (şarj sürüyor) →  charge20 / 40 / 60 / 80 / 100
+3) Aksi halde               →  battery20 / 40 / 60 / 80 / 100
+```
+
+Yüzde kovaları (ADC'den):
+
+| Pil % | İkon seviyesi |
+|-------|----------------|
+| %81 – %100 | 100 |
+| %61 – %80 | 80 |
+| %41 – %60 | 60 |
+| %21 – %40 | 40 |
+| %0 – %20 | 20 |
+
+### Kalibrasyon
+
+`src/main.cpp` içinde (multimetre ile ayarlanmış):
+
+```cpp
+#define BAT_CALIB_VBAT        4.07f   // Gerçek pil voltajı (V)
+#define BAT_CALIB_ESP_ADC_V   2.803f  // Aynı anda GPIO0 ham okuma (V)
+#define BAT_FULL_V            4.20f
+#define BAT_EMPTY_V           3.00f
+```
+
+Ekran ve ikon yüzdesi bu kalibrasyondan türetilir. Farklı direnç veya pil için değerleri güncelleyin.
+
+### Pil Durumu menüsü
+
+**Ayarlar → Pil Durumu** sayfasında (≈1,5 sn yenileme):
+
+- Şarj metni (Sarj oluyor / tamam / yok)
+- Voltaj, %, sağlık özeti
+- Ana ekranda hangi ikonun seçildiği (`battery85` / `charge60` / `full`)
+- CHRG ve STDBY pin durumu (L=aktif, H=pasif)
+- Duruma özel uyarılar
+
+### Üst çubuk düzeni
+
+Sağ üstte: `[WiFi ikonu]` + `[Pil ikonu]` — tarih/saat çizimi bu alanı silmez (önceki tam ekran `fillRect` sorunu giderildi).
 
 ---
 
@@ -600,6 +733,31 @@ Sinyal gücüne göre dinamik ikonlar:
 - NTP sunucusuna erişilebildiğinden emin olun
 - GMT offset değerini kontrol edin
 - İnternet bağlantısını kontrol edin
+
+### Pil Yüzdesi Yanlış / İkon Uymuyor
+
+**Sorun:** Ekrandaki % veya voltaj multimetre ile uyuşmuyor
+
+**Çözümler:**
+- `BAT_CALIB_VBAT` ve `BAT_CALIB_ESP_ADC_V` değerlerini multimetre ile yeniden kalibre edin
+- Voltaj bölücü dirençlerini kontrol edin (ör. 100k / 200k)
+- GPIO0 bağlantısının doğru olduğundan emin olun
+
+### Şarj Durumu Hep "Sarj yok"
+
+**Sorun:** USB takılıyken bile şarj metni değişmiyor
+
+**Çözümler:**
+- TP4056 **CHRG → GPIO21**, **STDBY → GPIO20** (active LOW)
+- Modül çıkışlarının ESP32'ye doğru bağlandığını kontrol edin
+- **Pil Durumu** menüsünde CHRG/STDBY pin satırlarını izleyin
+- Serial Monitor: `TP4056 CHRG=… STDBY=…` logları
+
+### Pil İkonu Yarım veya Kayboluyor
+
+**Sorun:** Sağ üst pil ikonu kesik görünüyor
+
+**Çözüm:** v1.5.0+ sürümünde üst çubuk ayrıldı; güncel firmware yükleyin.
 
 ---
 
@@ -679,11 +837,14 @@ Katkılarınızı bekliyoruz! Lütfen:
 ## 📝 Versiyon Geçmişi
 
 ### v1.5.0 (Mevcut)
-- 🔋 Pil seviye ikonları (battery20–100) ve şarj ikonları (charge20–100)
-- ⚡ TP4056 şarj durumu (CHRG/STDBY), tamamlandığında `full` ikonu
-- 📊 Pil Durumu menüsü: şarj metni, pin durumu, ekran ikonu bilgisi
-- 🔧 Pil voltaj kalibrasyonu ve üst çubuk (WiFi + pil) düzeni
-- 📡 PlatformIO OTA ortamı (`esp32c3_super_mini_ota`)
+- 🔋 **Pil ikon sistemi:** `battery20`–`battery100` (normal kullanım)
+- ⚡ **Şarj ikonları:** `charge20`–`charge100` (TP4056 şarj sırasında, aynı % kovaları)
+- ✅ **Tamam ikonu:** `full` (STDBY aktif, CHRG pasif)
+- 📊 **Pil Durumu menüsü:** şarj metni, voltaj/%, sağlık, ikon adı, CHRG/STDBY pinleri
+- 🔧 **ADC kalibrasyonu** (`BAT_CALIB_*`) ve GPIO0 voltaj bölücü
+- 📶 **Üst çubuk:** WiFi + pil ikonu; ortada `% X.XXV` metni
+- 📡 **PlatformIO:** `esp32c3_super_mini_ota` varsayılan OTA ortamı
+- 🌐 **WiFiManager** 2.x, Türkçe/İngilizce dil desteği menüde
 
 ### v1.4.0
 - 🌐 WiFiManager + Captive Portal entegrasyonu

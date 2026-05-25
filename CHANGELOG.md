@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sağ üst çubuk: WiFi ikonu + pil ikonu; tarih/saat çizimi üst bandı silmiyor
 - `drawBatteryIcon()` / `pickBatteryIconBitmap()` ile otomatik ikon seçimi
 - WiFiManager kütüphanesi `^2.0.17`
+- README: pil/şarj sistemi, TP4056 pinleri, kalibrasyon, OTA ortamları, sorun giderme
 
 ## [1.4.0] - 2024-12-XX
 
