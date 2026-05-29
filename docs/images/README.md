@@ -1,14 +1,11 @@
 # Proje Görselleri
 
-Bu klasöre proje görsellerini ekleyin:
+| Dosya | Açıklama |
+|-------|----------|
+| `project-setup.jpg` | Perfboard üzerinde donanım kurulumu |
+| `home-dashboard.png` | Ana ekran (hava, saat, pil, WiFi, MENU) |
+| `ota-update.png` | WiFi OTA güncelleme ekranı |
+| `menu-settings.png` | Ayarlar menüsü (1. sayfa) |
+| `menu-settings-page2.png` | Ayarlar menüsü (2. sayfa) |
 
-- `project-setup.jpg` - Proje kurulumu ve donanım görseli
-- `dashboard-display.jpg` - Ekran görüntüsü
-- `ota-update.jpg` - OTA güncelleme ekranı
-
-## Resim Özellikleri
-
-- **Format:** JPG veya PNG
-- **Boyut:** Maksimum 1920x1080 (önerilen)
-- **Dosya boyutu:** Maksimum 2MB
-
+Önerilen: PNG/JPG, genişlik ≤ 1920 px, dosya boyutu ≤ 3 MB.

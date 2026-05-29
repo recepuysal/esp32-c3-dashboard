@@ -6,15 +6,33 @@
 #include "logo.h"
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
-#include <DHT.h>
-#include <DHT_U.h>
 #include <Preferences.h>
 #include "esp_sleep.h"
-#include "driver/gpio.h"
+#include "esp_netif.h"
 #include <WiFiManager.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <math.h>
+#if CONFIG_IDF_TARGET_ESP32S3
+#include <Adafruit_NeoPixel.h>
+#endif
 
-#define VERSION_TEXT "v1.5.0"   // 🔥 SAG ALTA GÖRÜNECEK VERSİYON
+#define VERSION_TEXT "v1.8.14"  // Menu donusu: hava paneli silinmesi
+
+#define LEFT_INFO_W  86
+#define LEFT_INFO_H  44
+#define LEFT_LINE1_Y 4
+#define LEFT_LINE2_Y 16
+#define LEFT_LINE3_Y 28
+#define CHARGE_STATUS_Y 42
+#define WEATHER_HTTP_UA  "ESP32-ST7789-Dashboard/1.8.9"
+#define WEATHER_BODY_MAX 8192
+
+// Sabit konum — IP ile ilce tahmini guvenilir degil
+#define WEATHER_REGION_NAME  "Umraniye"
+#define WEATHER_LAT          41.0214f
+#define WEATHER_LON          29.1247f
 
 // =====================================================
 // 🔹 Wi-Fi Bilgileri (WiFiManager ile yapılandırılacak)
@@ -28,30 +46,61 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3 * 3600;
 const int daylightOffset_sec = 0;
 
-// 🔹 TFT Pinleri
+// ===== ESP32-S3 Super Mini — pin haritasi (ST7789 320x172) =====
+// TFT:  VCC=3V3  GND  CS=10  DC=7  RST=5  SCK=4  MOSI=6  BL=2
+// Pil:  LiPo+ --100k-- GPIO1 --200k-- GND
+// Enc:  CLK=8  DT=9  SW=3
+// TP4056: CHRG=13  STDBY=12 (active LOW)
+// Buzzer: GPIO11 (+)  GND (-)
+// Onboard WS2812 RGB: GPIO48 (S3 Super Mini)
+// ================================================================
+
+#if CONFIG_IDF_TARGET_ESP32S3
+#define ONBOARD_RGB_PIN      48
+// NeoPixel setBrightness 0-255; onceki 40 cok parlakti -> %50 = 20
+#define ONBOARD_RGB_BRIGHT_PCT  50
+#define ONBOARD_RGB_BRIGHT_BASE 40
+#define ONBOARD_RGB_BRIGHT      ((uint8_t)((ONBOARD_RGB_BRIGHT_BASE * ONBOARD_RGB_BRIGHT_PCT) / 100))
+#endif
+
 #define TFT_CS   10
 #define TFT_DC    7
 #define TFT_RST   5
 #define TFT_SCLK  4
 #define TFT_MOSI  6
 
-// 🔹 DHT11 Pin
-#define DHT_PIN   2   // GPIO2 - DHT11 DATA pini
+// 🔹 DHT11 (GPIO2 artik BL — sensör bagli degilse 0 birak)
+#define USE_DHT11 0
+#if USE_DHT11
+#include <DHT.h>
+#define DHT_PIN   21
+#endif
 
-// 🔹 Batarya ölçümü (LiPo → R1 100k → GPIO0 ← R2 200k → GND)
-#define BAT_ADC_PIN       0
-// Tek nokta kalibrasyon: multimetre pil / ESP analogRead (aynı anda ölçülmeli)
-// İnce ayar: multimetre 4.07V, ekran 4.14V → ESP_ADC *= 4.14/4.07
-#define BAT_CALIB_VBAT        4.07f
-#define BAT_CALIB_ESP_ADC_V   2.803f
+// 🔹 Batarya (LiPo → R1 100k → GPIO1/A0 ← R2 200k → GND)
+#define BAT_ADC_PIN       1
+// Kalibrasyon: aynı anda multimetre pil ucu + ekran (tek nokta)
+// Son ölçüm: multimetre 3.93V, ekran 4.17V → scale *= 3.93/4.17
+#define BAT_CALIB_VBAT        3.93f
+#define BAT_CALIB_ESP_ADC_V   2.871f
 #define BAT_VOLT_SCALE        (BAT_CALIB_VBAT / BAT_CALIB_ESP_ADC_V)
 #define BAT_FULL_V            4.20f
 #define BAT_EMPTY_V           3.00f
 #define BAT_DISPLAY_MAX_V     4.35f
 
-// 🔹 TP4056 (active LOW) — CHRG=şarj, STDBY=şarj tamam
-#define PIN_CHRG   21
-#define PIN_STDBY  20
+// TP4056 (active LOW) — CHRG/STDBY kablolari takas (GPIO12=STDBY, GPIO13=CHRG)
+#define PIN_CHRG   13
+#define PIN_STDBY  12
+
+// 🔹 Buzzer (aktif 3.3V) — ses yoksa BUZZER_ACTIVE_LOW 1 dene
+#define BUZZER_PIN 11
+#define BUZZER_ACTIVE_LOW 0
+#if BUZZER_ACTIVE_LOW
+#define BUZZER_ON  LOW
+#define BUZZER_OFF HIGH
+#else
+#define BUZZER_ON  HIGH
+#define BUZZER_OFF LOW
+#endif
 
 // 🔹 Encoder Pinleri
 #define ENCODER_CLK   8   // GPIO8 - CLK pini
@@ -59,11 +108,11 @@ const int daylightOffset_sec = 0;
 #define ENCODER_SW    3   // GPIO3 - Switch/Button pini
 
 // 🔹 Backlight Pin (PWM)
-#define TFT_BACKLIGHT 1   // GPIO1 - Backlight PWM pini
+#define TFT_BACKLIGHT 2   // GPIO2 - Backlight PWM
 #define LEDC_FREQ 5000    // PWM frekansı (Hz)
 #define LEDC_RESOLUTION 8 // 8-bit çözünürlük (0-255)
 #define USE_PWM true      // PWM kullanılsın
-#define BACKLIGHT_LEDC_CHANNEL 0
+#define BACKLIGHT_LEDC_CHANNEL 1   // S3: kanal 0 WiFi ile cakismasin
 
 #define TFT_WIDTH  320
 #define TFT_HEIGHT 172
@@ -95,8 +144,93 @@ static int topBarReservedWidth() {
   return BAT_ICON_W + WIFI_ICON_W + TOPBAR_GAP + TOPBAR_MARGIN + 8;
 }
 
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+#if CONFIG_IDF_TARGET_ESP32S3
+SPIClass tftSpi(HSPI);
+Adafruit_ST7789 tft(&tftSpi, TFT_CS, TFT_DC, TFT_RST);
+#else
+Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
+#endif
+
+#if USE_DHT11
 DHT dht(DHT_PIN, DHT11);
+#endif
+
+static void initDisplayBacklight() {
+  pinMode(TFT_BACKLIGHT, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT, HIGH);
+  if (USE_PWM) {
+    ledcSetup(BACKLIGHT_LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
+    ledcAttachPin(TFT_BACKLIGHT, BACKLIGHT_LEDC_CHANNEL);
+    ledcWrite(BACKLIGHT_LEDC_CHANNEL, 200);
+  }
+  Serial.println("Backlight acik (GPIO2)");
+}
+
+static void initDisplay() {
+  initDisplayBacklight();
+  delay(50);
+
+#if CONFIG_IDF_TARGET_ESP32S3
+  tftSpi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  tftSpi.setFrequency(27000000);
+  Serial.println("TFT SPI: HSPI 27MHz");
+#else
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+#endif
+
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, HIGH);
+  delay(10);
+  digitalWrite(TFT_RST, LOW);
+  delay(20);
+  digitalWrite(TFT_RST, HIGH);
+  delay(150);
+
+  tft.init(TFT_HEIGHT, TFT_WIDTH);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  Serial.printf("TFT ST7789 %dx%d init OK\n", TFT_WIDTH, TFT_HEIGHT);
+  Serial.printf("  CS=%d DC=%d RST=%d SCK=%d MOSI=%d BL=%d\n",
+                TFT_CS, TFT_DC, TFT_RST, TFT_SCLK, TFT_MOSI, TFT_BACKLIGHT);
+}
+
+static void printPinMap() {
+  Serial.println("--- Pin ozeti (S3 Super Mini) ---");
+  Serial.println("TFT: CS=10 DC=7 RST=5 SCK=4 MOSI=6 BL=2");
+  Serial.println("Pil ADC=1 | Enc 8/9/3 | CHRG=13 STDBY=12 | Buzzer=11");
+#if CONFIG_IDF_TARGET_ESP32S3
+  Serial.println("Onboard RGB WS2812: GPIO48");
+#endif
+}
+
+static void printChipInfo() {
+  Serial.println("--- Chip / bellek ---");
+  Serial.printf("Model: %s  rev=%d  cores=%d\n",
+                ESP.getChipModel(), ESP.getChipRevision(), ESP.getChipCores());
+  Serial.printf("Flash: %u byte (%.1f MB)\n",
+                ESP.getFlashChipSize(), ESP.getFlashChipSize() / 1048576.0f);
+  Serial.printf("PSRAM: %u byte\n", ESP.getPsramSize());
+  Serial.printf("Heap:  %u byte\n", ESP.getHeapSize());
+  if (ESP.getPsramSize() == 0) {
+    Serial.println("UYARI: PSRAM=0 — platformio.ini yanlis profil olabilir!");
+    Serial.println("  N4R2/FH4R2 -> env esp32s3_super_mini");
+    Serial.println("  N16R8      -> env esp32s3_super_mini_16mb");
+  }
+}
+
+static void buzzerBeep(uint16_t durationMs = 25) {
+  digitalWrite(BUZZER_PIN, BUZZER_ON);
+  delay(durationMs);
+  digitalWrite(BUZZER_PIN, BUZZER_OFF);
+}
+
+static void buzzerEncoderTick() {
+  buzzerBeep(18);
+}
+
+static void buzzerEncoderClick() {
+  buzzerBeep(35);
+}
 
 // =====================================================
 unsigned long lastTimeUpdate = 0;
@@ -105,11 +239,56 @@ const unsigned long timeInterval = 1000;
 String prevTime = "";
 String prevDate = "";
 String prevTemp = "";
-String prevHum = "";
+String prevHum = "";       // Geriye uyumluluk: prevDetail ile ayni
+String prevRegion = "";
+String prevDetail = "";
+String weatherRegion = "";
+String weatherCondition = "";
+float weatherTempC = NAN;
+bool locationValid = false;
+bool tempValid = false;
+bool conditionValid = false;
+bool astronValid = false;
+int sunriseHour = 6;
+int sunriseMin = 0;
+int sunsetHour = 20;
+int sunsetMin = 0;
+float geoLat = NAN;
+float geoLon = NAN;
+unsigned long lastLocationFetch = 0;
+unsigned long lastTempFetch = 0;
+unsigned long lastWeatherAttempt = 0;
+const unsigned long weatherFetchInterval = 900000UL;  // 15 dk
+const unsigned long weatherRetryInterval = 10000UL; // basarisizda 10 sn
+static bool otaRgbActive = false;
 String prevBattery = "";
 String prevChargeStatus = "";
 static int lastBatteryPctForIcon = 0;
 String ipAddress = "";
+static String prevWifiStatusLine = "";
+static bool bottomBarVersionDrawn = false;
+static bool bottomBarMenuDrawn = false;
+
+static void resetBottomStatusBarCache() {
+  bottomBarVersionDrawn = false;
+  bottomBarMenuDrawn = false;
+  prevWifiStatusLine = "";
+}
+
+static void resetLeftInfoPanelCache() {
+  prevTemp = "";
+  prevRegion = "";
+  prevDetail = "";
+  prevHum = "";
+}
+
+static void resetMainPageCaches() {
+  resetBottomStatusBarCache();
+  resetLeftInfoPanelCache();
+}
+
+static void redrawHomeScreenWidgets();
+
 unsigned long lastBatteryRead = 0;
 const unsigned long batteryReadInterval = 30000;  // 30 saniyede bir ADC oku
 int prevOTAPercent = -1;  // OTA progress takibi için
@@ -130,7 +309,7 @@ unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 200;  // Debounce süresi artırıldı
 
 // 🔹 Menü Sistemi
-int currentMenuPage = 0;  // 0:Ana 1:Ayarlar 2:Parlaklik 3:WiFi 4:Istatistik 5:Sistem 6:WiFiSifirlaOnay 7:Dil 8:PilDurumu
+int currentMenuPage = 0;  // 0:Ana 1:Ayarlar 2:Parlaklik 3:WiFi 4:Istatistik 5:Sistem 6:WiFiSifirla 7:Dil 8:Pil
 int menuItem = 0;
 
 // 🔹 İstatistikler
@@ -140,6 +319,8 @@ float minHum = 999.0;
 float maxHum = -999.0;
 float sumTemp = 0.0;
 float sumHum = 0.0;
+float minChipTempC = 999.0f;
+float maxChipTempC = -999.0f;
 unsigned long readingCount = 0;
 unsigned long wifiConnectedTime = 0;  // WiFi bağlantı zamanı (millis)
 bool wifiWasConnected = false;
@@ -194,6 +375,585 @@ String getText(const char* tr, const char* en);
 String getMenuText(int index);
 void showBatteryHealthMenu(bool reset = false);
 String getBatteryHealthLabel(int pct, float vBat, uint16_t* colorOut);
+void drawWifiSetupScreen();
+void drawWifiSetupStatus(const char* status);
+void drawWifiStatusLine();
+void startWifiSetupPortal();
+void exitWifiSetupMode();
+void sanitizeWifiPrefs();
+bool hasSavedWifiCredentials();
+void drawMainDashboard();
+void drawDHT11Data(bool forceRedraw = false);
+void initOnboardRgb();
+void updateOnboardRgb();
+
+static String jsonExtractString(const String& json, const char* key) {
+  String q = String("\"") + key + "\":\"";
+  int i = json.indexOf(q);
+  if (i < 0) return "";
+  i += q.length();
+  int j = json.indexOf('"', i);
+  if (j < 0) return "";
+  return json.substring(i, j);
+}
+
+static float jsonExtractFloat(const String& json, const char* key) {
+  String q = String("\"") + key + "\":";
+  int pos = 0;
+  while (pos < (int)json.length()) {
+    int i = json.indexOf(q, pos);
+    if (i < 0) {
+      return NAN;
+    }
+    i += q.length();
+    while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) {
+      i++;
+    }
+    // current_units icinde "weather_code":"wmo code" gibi metinleri atla
+    if (i < (int)json.length() && json[i] == '"') {
+      pos = i + 1;
+      continue;
+    }
+    int j = i;
+    while (j < (int)json.length()) {
+      char c = json[j];
+      if (isdigit(c) || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') {
+        j++;
+      } else {
+        break;
+      }
+    }
+    if (j == i) {
+      pos = i + 1;
+      continue;
+    }
+    return json.substring(i, j).toFloat();
+  }
+  return NAN;
+}
+
+static float jsonExtractNumber(const String& json, const char* key) {
+  float v = jsonExtractFloat(json, key);
+  if (!isnan(v)) {
+    return v;
+  }
+  String s = jsonExtractString(json, key);
+  if (s.length() > 0) {
+    return s.toFloat();
+  }
+  return NAN;
+}
+
+static String jsonExtractDailyArrayFirst(const String& json, const char* key) {
+  String q = String("\"") + key + "\":[\"";
+  int i = json.indexOf(q);
+  if (i < 0) {
+    return "";
+  }
+  i += q.length();
+  int j = json.indexOf('"', i);
+  if (j < 0) {
+    return "";
+  }
+  return json.substring(i, j);
+}
+
+static bool parseIsoLocalHm(const String& iso, int& hourOut, int& minOut) {
+  int tPos = iso.indexOf('T');
+  if (tPos < 0) {
+    return false;
+  }
+  int colon = iso.indexOf(':', tPos);
+  if (colon < 0) {
+    return false;
+  }
+  hourOut = iso.substring(tPos + 1, colon).toInt();
+  int colon2 = iso.indexOf(':', colon + 1);
+  if (colon2 > colon) {
+    minOut = iso.substring(colon + 1, colon2).toInt();
+  } else {
+    minOut = iso.substring(colon + 1).toInt();
+  }
+  return true;
+}
+
+static double julianDay(int y, int m, int d) {
+  if (m <= 2) {
+    y -= 1;
+    m += 12;
+  }
+  int A = y / 100;
+  int B = 2 - A + (A / 4);
+  return (int)(365.25 * (y + 4716)) + (int)(30.6001 * (m + 1)) + d + B - 1524.5;
+}
+
+static float moonPhaseIndex(int y, int m, int d) {
+  const double synodic = 29.530588853;
+  const double refNewMoonJd = 2451550.26;
+  double jd = julianDay(y, m, d) + 0.5;
+  double age = fmod(jd - refNewMoonJd, synodic);
+  if (age < 0.0) {
+    age += synodic;
+  }
+  return (float)(age / synodic);
+}
+
+static const char* moonPhaseToText(float phase) {
+  if (phase < 0.03f || phase > 0.97f) {
+    return "Yeni ay";
+  }
+  if (phase < 0.22f) {
+    return "Hilal";
+  }
+  if (phase < 0.30f) {
+    return "Ilk yarim";
+  }
+  if (phase < 0.47f) {
+    return "Sisik ay";
+  }
+  if (phase < 0.53f) {
+    return "Dolunay";
+  }
+  if (phase < 0.70f) {
+    return "Sisik ay";
+  }
+  if (phase < 0.78f) {
+    return "Son yarim";
+  }
+  return "Hilal";
+}
+
+static bool isNightTime(const struct tm& t) {
+  if (!astronValid) {
+    return false;
+  }
+  int nowMin = t.tm_hour * 60 + t.tm_min;
+  int riseMin = sunriseHour * 60 + sunriseMin;
+  int setMin = sunsetHour * 60 + sunsetMin;
+  return (nowMin >= setMin) || (nowMin < riseMin);
+}
+
+static float parseWttrTempLine(const String& raw) {
+  String t = raw;
+  t.trim();
+  t.replace("\r", "");
+  t.replace("\n", "");
+  t.replace("°C", "");
+  t.replace("C", "");
+  t.replace("+", "");
+  t.trim();
+  if (t.length() == 0) {
+    return NAN;
+  }
+  return t.toFloat();
+}
+
+static void configureWifiDns() {
+  esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!netif) {
+    return;
+  }
+  esp_netif_dns_info_t dns;
+  dns.ip.type = ESP_IPADDR_TYPE_V4;
+  dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+  esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
+  dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
+  esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns);
+}
+
+static bool httpRequest(const char* url, String& bodyOut, int timeoutMs = 20000) {
+  bodyOut = "";
+  bool useHttps = (strncmp(url, "https://", 8) == 0);
+
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
+  http.setConnectTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+
+  WiFiClient plain;
+  WiFiClientSecure secure;
+  bool begun = false;
+
+  if (useHttps) {
+    secure.setInsecure();
+    secure.setTimeout(timeoutMs / 1000);
+    begun = http.begin(secure, url);
+  } else {
+    plain.setTimeout(timeoutMs / 1000);
+    begun = http.begin(plain, url);
+  }
+
+  if (!begun) {
+    Serial.printf("HTTP begin: %s\n", url);
+    return false;
+  }
+
+  http.addHeader("User-Agent", WEATHER_HTTP_UA);
+  http.addHeader("Accept", "*/*");
+  http.addHeader("Connection", "close");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("HTTP %d (%s): %s\n", code, http.errorToString(code).c_str(), url);
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  if (stream) {
+    bodyOut.reserve(512);
+    unsigned long t0 = millis();
+    while (http.connected() && bodyOut.length() < WEATHER_BODY_MAX &&
+           (millis() - t0) < (unsigned long)timeoutMs) {
+      while (stream->available() && bodyOut.length() < WEATHER_BODY_MAX) {
+        bodyOut += (char)stream->read();
+      }
+      if (!stream->available()) {
+        delay(10);
+      }
+    }
+  } else {
+    bodyOut = http.getString();
+    if (bodyOut.length() > WEATHER_BODY_MAX) {
+      bodyOut = bodyOut.substring(0, WEATHER_BODY_MAX);
+    }
+  }
+
+  http.end();
+  return bodyOut.length() > 0;
+}
+
+static int clockAreaLeft() {
+  return LEFT_INFO_W;
+}
+
+static int clockAreaWidth() {
+  return TFT_WIDTH - topBarReservedWidth() - LEFT_INFO_W;
+}
+
+static bool fetchLocationData() {
+  weatherRegion = WEATHER_REGION_NAME;
+  geoLat = WEATHER_LAT;
+  geoLon = WEATHER_LON;
+  locationValid = true;
+  lastLocationFetch = millis();
+  prevHum = "";
+  Serial.println("Konum: Umraniye (sabit)");
+  return true;
+}
+
+// WMO hava kodu -> kisa Turkce metin (open-meteo weather_code)
+static const char* wmoCodeToText(int code) {
+  switch (code) {
+    case 0: return "Gunesli";
+    case 1: return "Az bulutlu";
+    case 2: return "Parcali bulut";
+    case 3: return "Kapali";
+    case 45:
+    case 48: return "Sisli";
+    case 51:
+    case 53:
+    case 55: return "Cisenti";
+    case 56:
+    case 57: return "Donan cisenti";
+    case 61: return "Hafif yagmur";
+    case 63: return "Yagmurlu";
+    case 65: return "Siddetli yagmur";
+    case 66:
+    case 67: return "Donan yagmur";
+    case 71: return "Hafif kar";
+    case 73: return "Karli";
+    case 75: return "Siddetli kar";
+    case 77: return "Kar taneleri";
+    case 80: return "Sagak yagmur";
+    case 81: return "Kuvvetli sagak";
+    case 82: return "Cok siddetli";
+    case 85:
+    case 86: return "Kar yagisi";
+    case 95: return "Firtina";
+    case 96:
+    case 99: return "Dolu";
+    default: return "";
+  }
+}
+
+static String wttrConditionToTurkish(const String& raw) {
+  String s = raw;
+  s.trim();
+  s.replace("\r", "");
+  s.replace("\n", "");
+  s.toLowerCase();
+
+  if (s.indexOf("thunder") >= 0) return "Firtina";
+  if (s.indexOf("hail") >= 0) return "Dolu";
+  if (s.indexOf("sleet") >= 0 || s.indexOf("ice pellets") >= 0) return "Karla karisik";
+  if (s.indexOf("snow") >= 0) return "Karli";
+  if (s.indexOf("heavy rain") >= 0) return "Siddetli yagmur";
+  if (s.indexOf("light rain") >= 0 || s.indexOf("patchy rain") >= 0) return "Hafif yagmur";
+  if (s.indexOf("rain") >= 0 || s.indexOf("drizzle") >= 0) return "Yagmurlu";
+  if (s.indexOf("fog") >= 0 || s.indexOf("mist") >= 0) return "Sisli";
+  if (s.indexOf("overcast") >= 0) return "Kapali";
+  if (s.indexOf("partly cloudy") >= 0) return "Parcali bulut";
+  if (s.indexOf("cloudy") >= 0) return "Bulutlu";
+  if (s.indexOf("sunny") >= 0 || s.indexOf("clear") >= 0) return "Gunesli";
+
+  if (raw.length() > 14) {
+    return raw.substring(0, 14);
+  }
+  return raw;
+}
+
+// ---------- SICAKLIK + HAVA DURUMU (open-meteo, tek istek) ----------
+static bool fetchOpenMeteoCurrent(float lat, float lon, float& tempOut, int& wmoCodeOut) {
+  char url[300];
+  snprintf(url, sizeof(url),
+           "http://api.open-meteo.com/v1/forecast?"
+           "latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,weather_code"
+           "&daily=sunrise,sunset&forecast_days=1&timezone=auto",
+           lat, lon);
+
+  String body;
+  if (!httpRequest(url, body)) {
+    return false;
+  }
+  Serial.println(body);
+
+  float temp = jsonExtractFloat(body, "temperature_2m");
+  if (isnan(temp)) {
+    return false;
+  }
+  tempOut = temp;
+
+  float codeF = jsonExtractFloat(body, "weather_code");
+  wmoCodeOut = isnan(codeF) ? -1 : (int)(codeF + 0.5f);
+
+  String riseIso = jsonExtractDailyArrayFirst(body, "sunrise");
+  String setIso = jsonExtractDailyArrayFirst(body, "sunset");
+  int rh = 0, rm = 0, sh = 0, sm = 0;
+  if (parseIsoLocalHm(riseIso, rh, rm) && parseIsoLocalHm(setIso, sh, sm)) {
+    sunriseHour = rh;
+    sunriseMin = rm;
+    sunsetHour = sh;
+    sunsetMin = sm;
+    astronValid = true;
+    Serial.printf("Gunes dogumu: %02d:%02d  batimi: %02d:%02d\n",
+                  sunriseHour, sunriseMin, sunsetHour, sunsetMin);
+  }
+
+  return true;
+}
+
+static bool fetchConditionWttr(float lat, float lon, String& condOut) {
+  char url[96];
+  snprintf(url, sizeof(url), "http://wttr.in/~%.2f,%.2f?format=%%C", lat, lon);
+
+  String body;
+  if (!httpRequest(url, body, 12000)) {
+    return false;
+  }
+  body.trim();
+  Serial.print("wttr durum: ");
+  Serial.println(body);
+  if (body.length() == 0) {
+    return false;
+  }
+  condOut = wttrConditionToTurkish(body);
+  return condOut.length() > 0;
+}
+
+static bool fetchTempWttr(float lat, float lon, float& tempOut) {
+  char url[96];
+  snprintf(url, sizeof(url), "http://wttr.in/~%.2f,%.2f?format=%%t", lat, lon);
+
+  String body;
+  if (!httpRequest(url, body, 12000)) {
+    return false;
+  }
+  Serial.print("wttr sicaklik: ");
+  Serial.println(body);
+
+  float temp = parseWttrTempLine(body);
+  if (isnan(temp)) {
+    return false;
+  }
+  tempOut = temp;
+  return true;
+}
+
+static bool fetchTempWttrAuto(float& tempOut) {
+  String body;
+  if (!httpRequest("http://wttr.in/?format=%t", body, 12000)) {
+    return false;
+  }
+  Serial.print("wttr IP sicaklik: ");
+  Serial.println(body);
+
+  float temp = parseWttrTempLine(body);
+  if (isnan(temp)) {
+    return false;
+  }
+  tempOut = temp;
+  return true;
+}
+
+static bool fetchTemperatureData() {
+  Serial.println("--- Hava API (sicaklik + durum) ---");
+
+  float temp = NAN;
+  int wmoCode = -1;
+  bool ok = false;
+  bool gotCondition = false;
+
+  if (locationValid && !isnan(geoLat) && !isnan(geoLon)) {
+    ok = fetchOpenMeteoCurrent(geoLat, geoLon, temp, wmoCode);
+    if (ok && wmoCode >= 0) {
+      const char* txt = wmoCodeToText(wmoCode);
+      if (txt[0] != '\0') {
+        weatherCondition = txt;
+        conditionValid = true;
+        gotCondition = true;
+        Serial.print("Hava durumu (WMO ");
+        Serial.print(wmoCode);
+        Serial.print("): ");
+        Serial.println(weatherCondition);
+      }
+    }
+    if (!ok) {
+      ok = fetchTempWttr(geoLat, geoLon, temp);
+    }
+    if (!gotCondition) {
+      String wttrCond;
+      if (fetchConditionWttr(geoLat, geoLon, wttrCond)) {
+        weatherCondition = wttrCond;
+        conditionValid = true;
+        gotCondition = true;
+        Serial.print("Hava durumu (wttr): ");
+        Serial.println(weatherCondition);
+      }
+    }
+  }
+
+  if (!ok) {
+    ok = fetchTempWttrAuto(temp);
+  }
+
+  if (!ok || isnan(temp)) {
+    Serial.println("Sicaklik alinamadi");
+    conditionValid = false;
+    weatherCondition = "";
+    return false;
+  }
+
+  weatherTempC = temp;
+  tempValid = true;
+  lastTempFetch = millis();
+  prevTemp = "";
+  prevHum = "";
+  prevRegion = "";
+  prevDetail = "";
+
+  if (!gotCondition) {
+    conditionValid = false;
+    weatherCondition = "";
+  }
+
+  Serial.print("Sicaklik: ");
+  Serial.print(weatherTempC, 1);
+  Serial.println(" C");
+  return true;
+}
+
+static bool waitForTimeSync() {
+  struct tm timeinfo;
+  for (int i = 0; i < 15; i++) {
+    if (getLocalTime(&timeinfo)) {
+      return true;
+    }
+    delay(400);
+  }
+  return false;
+}
+
+void invalidateRegionalWeather() {
+  locationValid = false;
+  tempValid = false;
+  conditionValid = false;
+  astronValid = false;
+  weatherTempC = NAN;
+  weatherRegion = "";
+  weatherCondition = "";
+  geoLat = NAN;
+  geoLon = NAN;
+  lastLocationFetch = 0;
+  lastTempFetch = 0;
+  lastWeatherAttempt = 0;
+  prevTemp = "";
+  prevHum = "";
+  prevRegion = "";
+  prevDetail = "";
+}
+
+bool fetchRegionalWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  configureWifiDns();
+  delay(300);
+
+  bool gotLoc = fetchLocationData();
+  bool gotTemp = fetchTemperatureData();
+
+  if (gotLoc || gotTemp) {
+    if (currentMenuPage == 0 && !screenSaverActive) {
+      drawDHT11Data();
+    }
+  }
+
+  return gotLoc && gotTemp;
+}
+
+void updateRegionalWeather() {
+#if USE_DHT11
+  return;
+#endif
+  if (wifiSetupMode || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  bool needLoc = !locationValid ||
+                 (now - lastLocationFetch >= weatherFetchInterval);
+  bool needTemp = !tempValid ||
+                  (now - lastTempFetch >= weatherFetchInterval);
+  bool needCondition = !conditionValid && tempValid;
+
+  if (!needLoc && !needTemp && !needCondition) {
+    return;
+  }
+
+  if (lastWeatherAttempt != 0 &&
+      (now - lastWeatherAttempt < weatherRetryInterval)) {
+    return;
+  }
+
+  lastWeatherAttempt = now;
+
+  if (needLoc) {
+    fetchLocationData();
+  }
+  if (needTemp || needCondition) {
+    fetchTemperatureData();
+  }
+
+  if ((!locationValid || !tempValid || !conditionValid) &&
+      currentMenuPage == 0 && !screenSaverActive) {
+    drawDHT11Data();
+  }
+}
 
 // =======================================================
 //  🟦 OTA BAŞLATMA
@@ -201,33 +961,37 @@ String getBatteryHealthLabel(int pct, float vBat, uint16_t* colorOut);
 static bool otaInitialized = false;
 
 void resetOTA() {
-  otaInitialized = false;
+  // ArduinoOTA.begin() tekrar cagrilmamali — sadece bayrak (gecici kopma)
 }
 
 void startOTA() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
   if (otaInitialized) {
     return;
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi bagli degil - OTA baslatilmiyor");
-    return;
-  }
+  WiFi.setSleep(WIFI_PS_NONE);
 
   Serial.println("OTA yukleme servisi baslatiliyor...");
 
   if (!MDNS.begin(otaName)) {
-    Serial.println("mDNS baslatilamadi!");
+    Serial.println("mDNS baslatilamadi (IP ile yukleme yine calisir)");
   }
 
   ArduinoOTA.setHostname(otaName);
   ArduinoOTA.setPassword(otaPass);
+  ArduinoOTA.setPort(3232);
+  ArduinoOTA.setTimeout(120000);
   ArduinoOTA.setRebootOnSuccess(true);
 
   ArduinoOTA
       .onStart([]() {
         Serial.println("OTA Basladi!");
-        prevOTAPercent = -1;  // Reset progress tracking
+        otaRgbActive = true;
+        prevOTAPercent = -1;
         tft.fillScreen(ST77XX_BLACK);
         
         // Başlık
@@ -240,23 +1004,23 @@ void startOTA() {
         tft.drawRect(10, 70, TFT_WIDTH - 20, 25, ST77XX_WHITE);
       })
       .onEnd([]() {
-        Serial.println("OTA Tamamlandi!");
-        prevOTAPercent = -1;  // Reset
+        Serial.println("OTA Tamamlandi! Yeniden baslatiliyor...");
+        prevOTAPercent = -1;
         tft.fillScreen(ST77XX_BLACK);
         tft.setCursor(10, 70);
         tft.setTextColor(ST77XX_GREEN);
         tft.setTextSize(2);
-        tft.println("OTA Tamamlandi!");
-        delay(2000);
+        tft.println("OTA OK");
+        delay(800);
+        ESP.restart();
       })
       .onProgress([](unsigned int progress, unsigned int total) {
+        yield();
         int percent = (progress * 100) / total;
         
-        // Progress bar genişliği (çerçeve içinde)
         int barWidth = TFT_WIDTH - 22;
         int filledWidth = (progress * barWidth) / total;
         
-        // Sadece yeni eklenen kısmı çiz (kırpma önleme)
         if (prevOTAPercent != percent) {
           int prevFilledWidth = (prevOTAPercent >= 0) ? (prevOTAPercent * barWidth) / 100 : 0;
           
@@ -285,6 +1049,7 @@ void startOTA() {
         }
       })
       .onError([](ota_error_t error) {
+        otaRgbActive = false;
         Serial.printf("Hata[%u]\n", error);
         tft.fillScreen(ST77XX_BLACK);
         tft.setCursor(10, 70);
@@ -304,7 +1069,8 @@ void startOTA() {
   Serial.println(".local");
   Serial.print("Sifre: ");
   Serial.println(otaPass);
-  Serial.println("PlatformIO: env esp32c3_super_mini_ota");
+  Serial.println("PlatformIO: -e esp32s3_super_mini_ota");
+  Serial.println("upload_port = ekrandaki IP ile ayni olmali");
   Serial.println("========================================");
 }
 
@@ -312,6 +1078,14 @@ void startOTA() {
 // 🟦 VERSİYON YAZISI (SAĞ-ALT)
 // =======================================================
 void drawVersionText() {
+  if (wifiSetupMode || currentMenuPage != 0 || screenSaverActive) {
+    bottomBarVersionDrawn = false;
+    return;
+  }
+  if (bottomBarVersionDrawn) {
+    return;
+  }
+
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
 
@@ -321,11 +1095,12 @@ void drawVersionText() {
   tft.getTextBounds(VERSION_TEXT, 0, 0, &x1, &y1, &w, &h);
 
   int x = TFT_WIDTH - w - 6;
-  int y = TFT_HEIGHT - h - 6;
+  int y = TFT_HEIGHT - h - 20;
 
-  tft.fillRect(x, y, w + 2, h + 2, ST77XX_BLACK);
+  tft.fillRect(x - 2, y - 2, w + 6, h + 4, ST77XX_BLACK);
   tft.setCursor(x, y);
   tft.println(VERSION_TEXT);
+  bottomBarVersionDrawn = true;
 }
 
 // =======================================================
@@ -399,9 +1174,7 @@ void enterDeepSleep() {
   
   delay(2000);  // Mesajı göster
   
-  // Encoder butonunu (GPIO3) wake-up pini olarak ayarla
-  // ESP32-C3'te Deep Sleep için GPIO0-5 (RTC GPIO'lar) kullanılabilir
-  // GPIO3 RTC GPIO olduğu için kullanılabilir
+  // Encoder butonunu (GPIO3) wake-up pini olarak ayarla (RTC GPIO)
   // Buton pull-up olduğu için basıldığında LOW olur
   
   // Encoder interrupt'ını devre dışı bırak (Deep Sleep için gerekli)
@@ -412,18 +1185,16 @@ void enterDeepSleep() {
   pinMode(ENCODER_SW, INPUT_PULLUP);
   delay(200);  // Yapılandırmanın tamamlanması için bekle
   
-  // ESP32-C3 için Deep Sleep GPIO wake-up yapılandırması
-  // ESP32-C3'te esp_deep_sleep_enable_gpio_wakeup() direkt kullanılır
-  // Buton pull-up olduğu için basıldığında LOW olur
-  // GPIO3 bit mask: (1ULL << 3)
-  
   // Yedek olarak timer wake-up ekle (1 saat sonra otomatik uyanır)
   // Eğer GPIO wake-up çalışmazsa en azından timer ile uyanır
   esp_sleep_enable_timer_wakeup(3600000000ULL);  // 1 saat = 3600 saniye * 1000000 mikrosaniye
   
-  // GPIO wake-up'ı etkinleştir (bitmask ile)
-  // ESP_GPIO_WAKEUP_GPIO_LOW = LOW seviyesinde uyandır
+  // GPIO wake-up: C3 = gpio_wakeup, S3 = ext0 (encoder SW, active LOW)
+#if CONFIG_IDF_TARGET_ESP32C3
   esp_deep_sleep_enable_gpio_wakeup((1ULL << ENCODER_SW), ESP_GPIO_WAKEUP_GPIO_LOW);
+#else
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)ENCODER_SW, 0);
+#endif
   
   Serial.print("Deep Sleep basladi - GPIO");
   Serial.print(ENCODER_SW);
@@ -506,17 +1277,17 @@ void drawTimeAndDate(struct tm &timeinfo) {
 
   int16_t x1, y1;
   uint16_t w, h;
+  int areaW = clockAreaWidth();
 
-  // Tarih
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
-  tft.getTextBounds(bufDate, 0, 0, &x1, &y1, &w, &h);
+  tft.getTextBounds(curDate, 0, 0, &x1, &y1, &w, &h);
 
-  int dateX = (TFT_WIDTH - w) / 2;
+  int dateX = clockAreaLeft() + (areaW - (int)w) / 2;
   int dateY = 14;
 
   if (curDate != prevDate) {
-    tft.fillRect(0, dateY, TFT_WIDTH - topBarReservedWidth(), h + 4, ST77XX_BLACK);
+    tft.fillRect(dateX - 4, dateY, w + 8, h + 4, ST77XX_BLACK);
     tft.setCursor(dateX, dateY);
     tft.println(curDate);
     prevDate = curDate;
@@ -524,16 +1295,15 @@ void drawTimeAndDate(struct tm &timeinfo) {
     updateLogoByRSSI();
   }
 
-  // Saat
   tft.setTextSize(3);
   tft.setTextColor(ST77XX_WHITE);
   tft.getTextBounds(bufTime, 0, 0, &x1, &y1, &w, &h);
 
-  int timeX = (TFT_WIDTH - w) / 2;
+  int timeX = clockAreaLeft() + (areaW - (int)w) / 2;
   int timeY = dateY + h + 8;
 
   if (curTime != prevTime) {
-    tft.fillRect(0, timeY, TFT_WIDTH - topBarReservedWidth(), h + 6, ST77XX_BLACK);
+    tft.fillRect(timeX - 4, timeY, w + 8, h + 6, ST77XX_BLACK);
     tft.setCursor(timeX, timeY);
     tft.println(curTime);
     prevTime = curTime;
@@ -546,25 +1316,35 @@ void drawTimeAndDate(struct tm &timeinfo) {
 // 🟦 MENÜ BUTONU
 // =======================================================
 void drawMenuButton() {
-  // Menü butonu - alt ortada (yazı olarak)
-  tft.setTextSize(3);  // TextSize 2'den 3'e çıkarıldı
+  if (wifiSetupMode || currentMenuPage != 0 || screenSaverActive) {
+    bottomBarMenuDrawn = false;
+    return;
+  }
+  if (bottomBarMenuDrawn) {
+    return;
+  }
+
+  tft.setTextSize(3);
   tft.setTextColor(ST77XX_CYAN);
-  
+
   String menuText = "MENU";
   int16_t x1, y1;
   uint16_t w, h;
   tft.getTextBounds(menuText, 0, 0, &x1, &y1, &w, &h);
-  
-  // Alt ortada konumlandır
+
   int x = (TFT_WIDTH - w) / 2;
-  int y = TFT_HEIGHT - h - 8;
-  
-  // Önceki yazıyı temizle
+  int y = TFT_HEIGHT - h - 14;
+
   tft.fillRect(x - 2, y - 2, w + 4, h + 4, ST77XX_BLACK);
-  
-  // Menü yazısını çiz
   tft.setCursor(x, y);
   tft.println(menuText);
+  bottomBarMenuDrawn = true;
+}
+
+static void drawBottomStatusBar() {
+  drawVersionText();
+  drawMenuButton();
+  drawWifiStatusLine();
 }
 
 void drawLogo(const unsigned char *bitmap, int w, int h) {
@@ -575,14 +1355,25 @@ void drawLogo(const unsigned char *bitmap, int w, int h) {
 }
 
 void updateLogoByRSSI() {
-  int rssi = WiFi.RSSI();
+  int x = wifiIconX();
+  int y = wifiIconY();
+  tft.fillRect(x, y, WIFI_ICON_W, WIFI_ICON_H, ST77XX_BLACK);
 
-  if (rssi >= -60)
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.drawRect(x + 2, y + 1, WIFI_ICON_W - 4, WIFI_ICON_H - 2, ST77XX_RED);
+    tft.drawLine(x + 3, y + 2, x + WIFI_ICON_W - 3, y + WIFI_ICON_H - 2, ST77XX_RED);
+    tft.drawLine(x + WIFI_ICON_W - 3, y + 2, x + 3, y + WIFI_ICON_H - 2, ST77XX_RED);
+    return;
+  }
+
+  int rssi = WiFi.RSSI();
+  if (rssi >= -60) {
     drawLogo(epd_bitmap_High, 17, 13);
-  else if (rssi >= -80)
+  } else if (rssi >= -80) {
     drawLogo(epd_bitmap_Mid, 17, 13);
-  else
+  } else {
     drawLogo(epd_bitmap_Low, 17, 13);
+  }
 }
 
 // Pil ikonu: tamam → full | şarj → charge* | normal → battery* (aynı % kovaları)
@@ -616,28 +1407,54 @@ void drawBatteryIcon() {
 
 // =======================================================
 void drawIPAddress() {
+  drawWifiStatusLine();
+}
 
-  if (ipAddress != "") {
+bool hasSavedWifiCredentials() {
+  prefs.begin("wifi", true);
+  String ssid = prefs.getString("ssid", "");
+  prefs.end();
+  ssid.trim();
+  return ssid.length() > 0;
+}
 
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
-
-    int16_t x1, y1;
-    uint16_t w, h;
-
-    tft.getTextBounds(ipAddress.c_str(), 0, 0, &x1, &y1, &w, &h);
-
-    int x = 6;
-    int y = TFT_HEIGHT - h - 6;  // Bir alt satıra indirildi
-
-    tft.fillRect(x, y, w + 2, h + 4, ST77XX_BLACK);
-    tft.setCursor(x, y);
-    tft.println(ipAddress);
+void drawWifiStatusLine() {
+  if (wifiSetupMode || currentMenuPage != 0) {
+    return;
   }
+
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0) {
+    ipAddress = WiFi.localIP().toString();
+  } else {
+    if (prevWifiStatusLine.length() > 0) {
+      prevWifiStatusLine = "";
+      ipAddress = "";
+      tft.fillRect(TFT_WIDTH - 130, TFT_HEIGHT - 18, 130, 16, ST77XX_BLACK);
+    }
+    return;
+  }
+
+  if (ipAddress == prevWifiStatusLine) {
+    return;
+  }
+  prevWifiStatusLine = ipAddress;
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(ipAddress.c_str(), 0, 0, &x1, &y1, &w, &h);
+  int x = TFT_WIDTH - w - 6;
+  int y = TFT_HEIGHT - h - 6;
+
+  tft.fillRect(x - 2, y - 2, w + 6, h + 4, ST77XX_BLACK);
+  tft.setCursor(x, y);
+  tft.println(ipAddress);
 }
 
 // =======================================================
-// 🟦 BATARYA ÖLÇÜMÜ (voltaj bölücü GPIO0)
+// 🟦 BATARYA ÖLÇÜMÜ (voltaj bölücü GPIO1 / A0)
 // =======================================================
 static float lastBatAdcRawV = 0.0f;
 
@@ -685,6 +1502,80 @@ bool isChargeComplete() {
   return digitalRead(PIN_STDBY) == LOW;
 }
 
+#if CONFIG_IDF_TARGET_ESP32S3
+static Adafruit_NeoPixel onboardRgb(1, ONBOARD_RGB_PIN, NEO_GRB + NEO_KHZ800);
+static bool rgbReady = false;
+static unsigned long lastRgbUpdate = 0;
+static bool otaRgbPulse = false;
+
+void initOnboardRgb() {
+  onboardRgb.begin();
+  onboardRgb.setBrightness(ONBOARD_RGB_BRIGHT);
+  onboardRgb.clear();
+  onboardRgb.show();
+  rgbReady = true;
+  Serial.println("Onboard RGB LED hazir (GPIO48)");
+}
+
+static void showOnboardRgb(uint8_t r, uint8_t g, uint8_t b) {
+  if (!rgbReady) {
+    return;
+  }
+  onboardRgb.setPixelColor(0, onboardRgb.Color(r, g, b));
+  onboardRgb.show();
+}
+
+void updateOnboardRgb() {
+  if (!rgbReady) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (otaRgbActive) {
+    if (now - lastRgbUpdate >= 350) {
+      lastRgbUpdate = now;
+      otaRgbPulse = !otaRgbPulse;
+      showOnboardRgb(0, 0, otaRgbPulse ? 180 : 30);
+    }
+    return;
+  }
+
+  if (now - lastRgbUpdate < 400) {
+    return;
+  }
+  lastRgbUpdate = now;
+
+  if (screenSaverActive) {
+    showOnboardRgb(0, 0, 0);
+    return;
+  }
+
+  if (isCharging() && !isChargeComplete()) {
+    showOnboardRgb(255, 90, 0);
+    return;
+  }
+
+  if (wifiSetupMode) {
+    showOnboardRgb(255, 120, 0);
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiReconnecting || hasSavedWifiCredentials()) {
+      showOnboardRgb(255, 0, 0);
+      return;
+    }
+    showOnboardRgb(0, 0, 0);
+    return;
+  }
+
+  showOnboardRgb(0, 220, 0);
+}
+#else
+void initOnboardRgb() {}
+void updateOnboardRgb() {}
+#endif
+
 String getChargeStatusText() {
   bool chrg = isCharging();
   bool done = isChargeComplete();
@@ -727,9 +1618,9 @@ void drawChargeStatus() {
   tft.getTextBounds(status, 0, 0, &x1, &y1, &w, &h);
 
   const int x = 6;
-  const int y = 34;  // Nem satirinin alti (bos alan)
+  const int y = CHARGE_STATUS_Y;
 
-  tft.fillRect(x, y, 120, h + 4, ST77XX_BLACK);
+  tft.fillRect(x, y, LEFT_INFO_W - 8, h + 4, ST77XX_BLACK);
   tft.setCursor(x, y);
   tft.println(status);
 
@@ -743,7 +1634,20 @@ void drawChargeStatus() {
   Serial.println(status);
 }
 
-void drawBattery(bool forceRead = false) {
+static void clearMainPageBatteryLabels() {
+  // Hava paneli (y<LEFT_INFO_H) ile cakismasin — sadece sarj satiri
+  tft.fillRect(6, CHARGE_STATUS_Y - 2, LEFT_INFO_W - 8, 14, ST77XX_BLACK);
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.setTextSize(1);
+  tft.getTextBounds("100% 4.20V", 0, 0, &x1, &y1, &w, &h);
+  int textY = (TFT_HEIGHT - h) / 2;
+  if (textY > LEFT_INFO_H + 4) {
+    tft.fillRect(0, textY - 6, TFT_WIDTH, h + 12, ST77XX_BLACK);
+  }
+}
+
+void drawBattery(bool forceRead, bool showLabel) {
   unsigned long now = millis();
   if (!forceRead && (now - lastBatteryRead < batteryReadInterval)) {
     return;
@@ -761,6 +1665,17 @@ void drawBattery(bool forceRead = false) {
   }
   prevBattery = batStr;
 
+  drawBatteryIcon();
+
+  if (!showLabel) {
+    Serial.print("Batarya: ");
+    Serial.print(vBat, 2);
+    Serial.print(" V (");
+    Serial.print(pct);
+    Serial.println("%) [ikon only]");
+    return;
+  }
+
   tft.setTextSize(1);
   tft.setTextColor(batteryColor(pct));
 
@@ -770,8 +1685,6 @@ void drawBattery(bool forceRead = false) {
 
   int textX = (TFT_WIDTH - w) / 2;
   int textY = (TFT_HEIGHT - h) / 2;
-
-  drawBatteryIcon();
 
   tft.fillRect(textX - 4, textY - 2, w + 8, h + 4, ST77XX_BLACK);
   tft.setCursor(textX, textY);
@@ -924,7 +1837,12 @@ void showBatteryHealthMenu(bool reset) {
 // =======================================================
 // 🟦 DHT11 SICAKLIK VE NEM GÖSTERİMİ
 // =======================================================
-void drawDHT11Data() {
+void drawDHT11Data(bool forceRedraw) {
+  String tempStr;
+  String regionStr;
+  String detailStr;
+
+#if USE_DHT11
   float temperature = dht.readTemperature();
   float humidity = dht.readHumidity();
 
@@ -933,7 +1851,6 @@ void drawDHT11Data() {
     return;
   }
 
-  // İstatistikleri güncelle
   if (temperature < minTemp) minTemp = temperature;
   if (temperature > maxTemp) maxTemp = temperature;
   if (humidity < minHum) minHum = humidity;
@@ -942,53 +1859,118 @@ void drawDHT11Data() {
   sumHum += humidity;
   readingCount++;
 
-  String tempStr = String(temperature, 1) + " C";
-  String humStr = String(humidity, 1) + "%";
+  tempStr = String(temperature, 1) + " C";
+  regionStr = "--";
+  detailStr = String(humidity, 1) + "%";
+#else
+  struct tm timeinfo;
+  bool haveTime = getLocalTime(&timeinfo);
+  bool showMoon = haveTime && isNightTime(timeinfo);
 
-  // Sıcaklık güncellemesi - SOL ÜST
-  if (tempStr != prevTemp) {
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
-
-    int16_t x1, y1;
-    uint16_t w, h;
-    tft.getTextBounds(tempStr, 0, 0, &x1, &y1, &w, &h);
-
-    int x = 6;
-    int y = 6;
-
-    tft.fillRect(x, y, w + 4, h + 4, ST77XX_BLACK);
-    tft.setCursor(x, y);
-    tft.println(tempStr);
-    prevTemp = tempStr;
+  if (tempValid && !isnan(weatherTempC)) {
+    tempStr = String(weatherTempC, 1) + " C";
+  } else if (WiFi.status() == WL_CONNECTED) {
+    tempStr = "... C";
+  } else {
+    tempStr = "-- C";
   }
 
-  // Nem güncellemesi - SOL ÜST (Sıcaklığın altında)
-  if (humStr != prevHum) {
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
-
-    int16_t x1, y1;
-    uint16_t w, h;
-    tft.getTextBounds(humStr, 0, 0, &x1, &y1, &w, &h);
-
-    int x = 6;
-    int y = 20;  // Sıcaklığın hemen altında
-
-    tft.fillRect(x, y, w + 4, h + 4, ST77XX_BLACK);
-    tft.setCursor(x, y);
-    tft.println(humStr);
-    prevHum = humStr;
+  if (locationValid && weatherRegion.length() > 0) {
+    regionStr = weatherRegion;
+  } else if (WiFi.status() == WL_CONNECTED) {
+    regionStr = getText("Konum...", "Loc...");
+  } else {
+    regionStr = getText("WiFi yok", "No WiFi");
   }
+
+  if (showMoon) {
+    float mp = moonPhaseIndex(timeinfo.tm_year + 1900,
+                              timeinfo.tm_mon + 1,
+                              timeinfo.tm_mday);
+    detailStr = moonPhaseToText(mp);
+  } else if (conditionValid && weatherCondition.length() > 0) {
+    detailStr = weatherCondition;
+  } else if (WiFi.status() == WL_CONNECTED) {
+    detailStr = getText("Hava...", "Wx...");
+  } else {
+    detailStr = "--";
+  }
+#endif
+
+  if (!forceRedraw &&
+      tempStr == prevTemp && regionStr == prevRegion && detailStr == prevDetail) {
+    return;
+  }
+
+  // Sol ust — 3 satir: sicaklik, bolge, hava/ay
+  tft.fillRect(0, 0, LEFT_INFO_W, LEFT_INFO_H, ST77XX_BLACK);
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(6, LEFT_LINE1_Y);
+  tft.println(tempStr);
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(6, LEFT_LINE2_Y);
+  tft.println(regionStr);
+
+#if !USE_DHT11
+  if (!showMoon && conditionValid && weatherCondition.length() > 0 &&
+      detailStr == weatherCondition) {
+    tft.setTextColor(ST77XX_YELLOW);
+  } else {
+    tft.setTextColor(ST77XX_WHITE);
+  }
+#else
+  tft.setTextColor(ST77XX_WHITE);
+#endif
+  tft.setCursor(6, LEFT_LINE3_Y);
+  tft.println(detailStr);
+
+  prevTemp = tempStr;
+  prevRegion = regionStr;
+  prevDetail = detailStr;
+  prevHum = detailStr;
+}
+
+static void redrawHomeScreenWidgets() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    prevTime = "";
+    prevDate = "";
+    drawTimeAndDate(timeinfo);
+  } else {
+    prevTime = "";
+    prevDate = "";
+  }
+  prevBattery = "";
+  prevChargeStatus = "";
+  clearMainPageBatteryLabels();
+  drawBattery(true, false);
+  updateLogoByRSSI();
+  drawBottomStatusBar();
+  drawDHT11Data(true);
 }
 
 // =======================================================
 // 🟦 İSTATİSTİKLER SAYFASI
 // =======================================================
+static float readChipTempC() {
+  return temperatureRead();
+}
+
+static uint16_t chipTempColor(float chipC) {
+  if (chipC >= 70.0f) return ST77XX_RED;
+  if (chipC >= 55.0f) return ST77XX_YELLOW;
+  return ST77XX_WHITE;
+}
+
 void showStatisticsMenu(bool reset = false) {
   static bool firstDraw = true;
   static String prevUptimeStr = "";
   static String prevWifiUptimeStr = "";
+  static String prevChipTempStr = "";
+  static String prevChipRangeStr = "";
   
   // Değişkenleri fonksiyonun başında tanımla
   int lineHeight = 18;
@@ -998,8 +1980,16 @@ void showStatisticsMenu(bool reset = false) {
     firstDraw = true;
     prevUptimeStr = "";
     prevWifiUptimeStr = "";
+    prevChipTempStr = "";
+    prevChipRangeStr = "";
     return;
   }
+
+  float chipC = readChipTempC();
+  if (chipC < minChipTempC) minChipTempC = chipC;
+  if (chipC > maxChipTempC) maxChipTempC = chipC;
+  String chipTempStr = "Cip Sicakligi: " + String(chipC, 1) + " C";
+  String chipRangeStr = "Cip min/max: " + String(minChipTempC, 1) + " / " + String(maxChipTempC, 1) + " C";
   
   if (firstDraw) {
     tft.fillScreen(ST77XX_BLACK);
@@ -1018,11 +2008,20 @@ void showStatisticsMenu(bool reset = false) {
     
     // İlk çizimde tüm verileri göster
     tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
     
     yPos = 35;  // Başlangıç pozisyonu
+
+    tft.setTextColor(chipTempColor(chipC));
+    tft.setCursor(10, yPos);
+    tft.println(chipTempStr);
+    yPos += lineHeight;
+
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, yPos);
+    tft.println(chipRangeStr);
+    yPos += lineHeight;
     
-    // Ortalama Sıcaklık
+    // DHT istatistikleri (varsa)
     if (readingCount > 0) {
       float avgTemp = sumTemp / readingCount;
       String avgTempStr = "Ort. Sicaklik: " + String(avgTemp, 1) + " C";
@@ -1030,29 +2029,21 @@ void showStatisticsMenu(bool reset = false) {
       tft.println(avgTempStr);
       yPos += lineHeight;
       
-      // Maksimum/Minimum Sıcaklık
       String tempRangeStr = "Sicaklik: " + String(minTemp, 1) + " / " + String(maxTemp, 1) + " C";
       tft.setCursor(10, yPos);
       tft.println(tempRangeStr);
       yPos += lineHeight;
       
-      // Ortalama Nem
       float avgHum = sumHum / readingCount;
       String avgHumStr = "Ort. Nem: " + String(avgHum, 1) + " %";
       tft.setCursor(10, yPos);
       tft.println(avgHumStr);
       yPos += lineHeight;
       
-      // Maksimum/Minimum Nem
       String humRangeStr = "Nem: " + String(minHum, 1) + " / " + String(maxHum, 1) + " %";
       tft.setCursor(10, yPos);
       tft.println(humRangeStr);
       yPos += lineHeight;
-    } else {
-      String noDataStr = "Henuz veri yok";
-      tft.setCursor(10, yPos);
-      tft.println(noDataStr);
-      yPos += lineHeight * 2;
     }
     
     // Talimat (ortalanmış)
@@ -1063,18 +2054,37 @@ void showStatisticsMenu(bool reset = false) {
     tft.setCursor(instX, 155);
     tft.println(instructionText);
     
-    // İlk çizimde süreleri de göster
     prevUptimeStr = "";
     prevWifiUptimeStr = "";
+    prevChipTempStr = chipTempStr;
+    prevChipRangeStr = chipRangeStr;
   }
+
+  // Cip sicakligi - CANLI GUNCELLEME
+  yPos = 35;
+  if (chipTempStr != prevChipTempStr) {
+    tft.setTextSize(1);
+    tft.setTextColor(chipTempColor(chipC));
+    tft.fillRect(10, yPos, TFT_WIDTH - 20, lineHeight, ST77XX_BLACK);
+    tft.setCursor(10, yPos);
+    tft.println(chipTempStr);
+    prevChipTempStr = chipTempStr;
+  }
+  yPos += lineHeight;
+
+  if (chipRangeStr != prevChipRangeStr) {
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.fillRect(10, yPos, TFT_WIDTH - 20, lineHeight, ST77XX_BLACK);
+    tft.setCursor(10, yPos);
+    tft.println(chipRangeStr);
+    prevChipRangeStr = chipRangeStr;
+  }
+  yPos += lineHeight;
   
   // Sadece süreleri güncelle (canlı)
-  // İstatistik verilerinin yüksekliğini hesapla
-  yPos = 35;  // Başlangıç pozisyonu
   if (readingCount > 0) {
-    yPos += lineHeight * 4;  // 4 satır istatistik
-  } else {
-    yPos += lineHeight * 2;  // "Henuz veri yok" mesajı
+    yPos += lineHeight * 4;  // 4 satir DHT istatistik
   }
   
   // Toplam Çalışma Süresi (Uptime) - CANLI GÜNCELLEME
@@ -1168,7 +2178,7 @@ void showSystemInfoMenu(bool reset = false) {
   int lineHeight = 18;
   int yPos = 35;
   
-  // CPU Frekansı (ESP32-C3 için)
+  // CPU Frekansı
   uint32_t cpuFreq = ESP.getCpuFreqMHz();
   String cpuStr = "CPU Frekans: " + String(cpuFreq) + " MHz";
   tft.fillRect(10, yPos, TFT_WIDTH - 20, lineHeight, ST77XX_BLACK);
@@ -1549,22 +2559,20 @@ void showSettingsMenu() {
   tft.setCursor(10, 10);
   tft.println(getTitleText(0));  // "AYARLAR" / "SETTINGS"
   
-  // Menü kaydırma - eğer menuItem 4 veya üzeri ise kaydır
+  const int totalItems = 8;
   int startIndex = 0;
   if (menuItem >= 4) {
-    startIndex = menuItem - 3;  // En fazla 4 item göster, seçili item ortada olsun
-    if (startIndex > 4) startIndex = 4;  // 8 item, 4 gorunur
+    startIndex = menuItem - 3;
+    if (startIndex > totalItems - 4) startIndex = totalItems - 4;
   }
   
-  // Ekranda gösterilecek item sayısı (maksimum 4 item)
   int visibleItems = 4;
   int endIndex = startIndex + visibleItems;
-  if (endIndex > 8) endIndex = 8;  // 8 item (Pil Durumu eklendi)
+  if (endIndex > totalItems) endIndex = totalItems;
   
   for (int i = startIndex; i < endIndex; i++) {
     int displayIndex = i - startIndex;
     if (i == menuItem) {
-      // Seçili item: CYAN arka plan, WHITE text (ana sayfa uyumlu)
       tft.fillRect(15, 38 + (displayIndex * 25), TFT_WIDTH - 30, 22, ST77XX_CYAN);
       tft.setTextColor(ST77XX_BLACK);
     } else {
@@ -1574,8 +2582,7 @@ void showSettingsMenu() {
     tft.println(getMenuText(i));
   }
   
-  // Scroll göstergesi (eğer kaydırma varsa)
-  if (startIndex > 0 || endIndex < 8) {
+  if (startIndex > 0 || endIndex < totalItems) {
     tft.fillCircle(TFT_WIDTH - 10, 15, 3, ST77XX_WHITE);
   }
 }
@@ -1623,21 +2630,53 @@ void showWiFiInfoMenu(bool reset = false) {
     firstDraw = false;
   }
   
-  // WiFi durumu kontrolü
   if (WiFi.status() != WL_CONNECTED) {
-    if (firstDraw || prevRSSI != -999) {
-      tft.fillRect(10, 40, TFT_WIDTH - 20, 100, ST77XX_BLACK);
-      tft.setTextSize(2);
-      tft.setTextColor(ST77XX_RED);
-      String errorText = getText("BAGLI DEGIL!", "NOT CONNECTED!");
-      int16_t x1, y1;
-      uint16_t w, h;
-      tft.getTextBounds(errorText, 0, 0, &x1, &y1, &w, &h);
-      int errorX = (TFT_WIDTH - w) / 2;
-      tft.setCursor(errorX, 50);
-      tft.println(errorText);
-      prevRSSI = -999;
+    tft.fillRect(10, 32, TFT_WIDTH - 20, 118, ST77XX_BLACK);
+
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(70, 36);
+    tft.println(getText("BAGLI DEGIL", "NOT CONNECTED"));
+
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, 58);
+    if (hasSavedWifiCredentials()) {
+      prefs.begin("wifi", true);
+      String ssid = prefs.getString("ssid", "");
+      prefs.end();
+      tft.print(getText("Kayitli ag: ", "Saved network: "));
+      tft.setTextColor(ST77XX_YELLOW);
+      tft.println(ssid);
+      tft.setTextColor(ST77XX_CYAN);
+      tft.setCursor(10, 72);
+      tft.println(getText("Arka planda yeniden deneniyor", "Retrying in background"));
+    } else {
+      tft.println(getText("Henuz WiFi kaydi yok", "No WiFi saved yet"));
     }
+
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, 90);
+    tft.println(getText("Kurulum icin:", "To configure:"));
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(10, 102);
+    tft.println(getText("Menu > WiFi Ayarlari", "Menu > WiFi Settings"));
+
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, 118);
+    tft.println(getText("AP: ", "AP: ") + String(ap_ssid));
+    tft.setCursor(10, 130);
+    tft.print(getText("Sifre: ", "Pass: "));
+    tft.println(ap_password);
+    tft.setCursor(10, 142);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.println("http://192.168.4.1");
+
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(10, TFT_HEIGHT - 14);
+    tft.println(getText("Buton: geri don", "Button: go back"));
+
+    prevRSSI = -999;
     return;
   }
   
@@ -1740,10 +2779,9 @@ void handleEncoderNavigation() {
       Serial.print("Encoder pozisyon: ");
       Serial.println(encoderPosition);
     } else if (currentMenuPage == 1) {
-      // Ayarlar menüsünde item seçimi
       menuItem += diff;
       if (menuItem < 0) menuItem = 0;
-      if (menuItem > 7) menuItem = 7;  // 8 item (0-7)
+      if (menuItem > 7) menuItem = 7;
       showSettingsMenu();
     } else if (currentMenuPage == 6) {
       // WiFi Sıfırla onay ekranı
@@ -1767,6 +2805,7 @@ void handleEncoderNavigation() {
     }
     
     lastEncoderPosition = encoderPosition;
+    buzzerEncoderTick();
   }
   
   // Buton kontrolü
@@ -1774,12 +2813,14 @@ void handleEncoderNavigation() {
   
   if (encoderButtonPressed) {
     encoderButtonPressed = false;
-    
+    buzzerEncoderClick();
+
     // Buton basımı = aktivite (ekran koruyucuyu kapat)
     updateActivity();
     
     if (currentMenuPage == 0) {
       // Ana sayfadan ayarlar menüsüne geç
+      resetBottomStatusBarCache();
       currentMenuPage = 1;
       menuItem = 0;
       showSettingsMenu();
@@ -1791,62 +2832,42 @@ void handleEncoderNavigation() {
         showBrightnessMenu(true);  // Reset
         showBrightnessMenu();      // İlk çizim
       } else if (menuItem == 1) {
-        // "WiFi Ayarlari" seçildi - WiFi bilgileri sayfasına geç
-        currentMenuPage = 3;
-        showWiFiInfoMenu(true);  // Reset
-        showWiFiInfoMenu();      // İlk çizim
+        if (WiFi.status() == WL_CONNECTED) {
+          currentMenuPage = 3;
+          showWiFiInfoMenu(true);
+          showWiFiInfoMenu();
+        } else {
+          currentMenuPage = 0;
+          startWifiSetupPortal();
+        }
       } else if (menuItem == 2) {
         // "Dil" seçildi - Dil seçim sayfasına geç
         currentMenuPage = 7;  // Dil seçim sayfası
         languageSelectionItem = currentLanguage;  // Mevcut dili seçili göster
         showLanguageMenu();
       } else if (menuItem == 3) {
-        // "Istatistikler" seçildi - İstatistikler sayfasına geç
         currentMenuPage = 4;
-        showStatisticsMenu(true);  // Reset
-        showStatisticsMenu();      // İlk çizim
+        showStatisticsMenu(true);
+        showStatisticsMenu();
       } else if (menuItem == 4) {
-        // "Pil Durumu" seçildi
         currentMenuPage = 8;
         showBatteryHealthMenu(true);
         showBatteryHealthMenu();
       } else if (menuItem == 5) {
-        // "Sistem Bilgileri" seçildi
         currentMenuPage = 5;
         showSystemInfoMenu(true);
         showSystemInfoMenu();
       } else if (menuItem == 6) {
-        // "WiFi Sifirla" seçildi
         currentMenuPage = 6;
         showWiFiResetConfirm();
       } else if (menuItem == 7) {
         // "Geri Don" seçildi - ana sayfaya dön
+        resetMainPageCaches();
         currentMenuPage = 0;
         tft.fillScreen(ST77XX_BLACK);
-        
-        // Önceki değerleri sıfırla ki tekrar çizilsin
-        prevTime = "";
-        prevDate = "";
-        prevTemp = "";
-        prevHum = "";
-        prevBattery = "";
-        
-        // lastTimeUpdate'i sıfırla ki hemen güncellensin
         lastTimeUpdate = 0;
         lastBatteryRead = 0;
-        
-        // Ana sayfa çizimlerini hemen yeniden çiz
-        struct tm timeinfo;
-        if (getLocalTime(&timeinfo)) {
-          drawTimeAndDate(timeinfo);
-          drawDHT11Data();
-          drawChargeStatus();
-          drawBattery(true);
-          updateLogoByRSSI();
-          drawIPAddress();
-          drawMenuButton();     // 🔥 MENÜ BUTONU
-          drawVersionText();
-        }
+        redrawHomeScreenWidgets();
       } else {
         // Diğer menü item'ları için (ileride fonksiyonellik eklenebilir)
         Serial.print("Menu item secildi: ");
@@ -1866,10 +2887,9 @@ void handleEncoderNavigation() {
       showWiFiInfoMenu(true);  // Reset
       showSettingsMenu();
     } else if (currentMenuPage == 4) {
-      // İstatistikler sayfasından ayarlar menüsüne geri dön
       currentMenuPage = 1;
-      menuItem = 3;  // Istatistikler seçili kalsın (index 3)
-      showStatisticsMenu(true);  // Reset
+      menuItem = 3;
+      showStatisticsMenu(true);
       showSettingsMenu();
     } else if (currentMenuPage == 5) {
       currentMenuPage = 1;
@@ -1889,8 +2909,8 @@ void handleEncoderNavigation() {
       } else {
         // HAYIR seçildi - menüye dön
         currentMenuPage = 1;
-        menuItem = 6;
-        wifiResetConfirmItem = 0;  // Reset
+        menuItem = 7;
+        wifiResetConfirmItem = 0;
         showSettingsMenu();
       }
     } else if (currentMenuPage == 7) {
@@ -1919,23 +2939,8 @@ void updateTimeIfNeeded() {
     needRedraw = false;
     if (currentMenuPage == 0) {
       // Ana sayfa çizimlerini yeniden yap
-      struct tm timeinfo;
-      if (getLocalTime(&timeinfo)) {
-        prevTime = "";  // Yeniden çizilsin
-        prevDate = "";
-        prevTemp = "";
-        prevHum = "";
-        prevBattery = "";
-        prevChargeStatus = "";
-        drawTimeAndDate(timeinfo);
-        drawDHT11Data();
-        drawChargeStatus();
-        drawBattery(true);
-        updateLogoByRSSI();
-        drawIPAddress();
-        drawMenuButton();
-        drawVersionText();
-      }
+      resetMainPageCaches();
+      redrawHomeScreenWidgets();
     }
   }
 
@@ -1948,18 +2953,14 @@ void updateTimeIfNeeded() {
     }
 
     if (currentMenuPage == 0) {
-      // Ana sayfa çizimleri
       struct tm timeinfo;
       if (getLocalTime(&timeinfo)) {
         drawTimeAndDate(timeinfo);
-        drawDHT11Data();      // 🔥 DHT11 VERİLERİNİ GÖSTER
-        drawChargeStatus();
-        drawBattery();
-        updateLogoByRSSI();
-        drawIPAddress();
-        drawMenuButton();     // 🔥 MENÜ BUTONU
-        drawVersionText();   // 🔥 VERSİYON SÜREKLİ GÜNCELLENİR
       }
+      drawDHT11Data();
+      drawBattery(false, false);
+      updateLogoByRSSI();
+      drawBottomStatusBar();
     } else if (currentMenuPage == 3) {
       // WiFi bilgileri sayfası - sinyal gücü güncellensin
       showWiFiInfoMenu();
@@ -1993,9 +2994,9 @@ void checkWiFiConnection() {
     if (WiFi.status() != WL_CONNECTED) {
       if (!wifiReconnecting) {
         wifiReconnecting = true;
-        lastReconnectAttempt = 0;  // Hemen dene
-        wifiWasConnected = false;  // Bağlantı koptu
-        resetOTA();
+        lastReconnectAttempt = 0;
+        wifiWasConnected = false;
+        invalidateRegionalWeather();
         Serial.println("WiFi baglantisi koptu! Yeniden baglanma baslatiliyor...");
       }
       
@@ -2011,7 +3012,8 @@ void checkWiFiConnection() {
         String savedPass = prefs.getString("pass", "");
         prefs.end();
         
-        if (savedSSID.length() > 0 && savedPass.length() > 0) {
+        if (savedSSID.length() > 0) {
+          savedSSID.trim();
           // WiFi'yi durdur ve yeniden başlat (hızlı, blocking değil)
           WiFi.disconnect();
           delay(100);  // Kısa delay, blocking değil
@@ -2019,13 +3021,6 @@ void checkWiFiConnection() {
           WiFi.begin(savedSSID.c_str(), savedPass.c_str());
           
           Serial.println("baslatildi (non-blocking)");
-        } else {
-          Serial.println("Kayitli WiFi bilgisi yok, WiFiManager aciliyor...");
-          // WiFi bilgisi yoksa veya şifre yoksa WiFiManager'ı başlat
-          wifiSetupMode = true;
-          WiFi.disconnect();
-          delay(100);
-          // WiFiManager loop() içinde handle edilecek
         }
       }
     } else {
@@ -2037,6 +3032,7 @@ void checkWiFiConnection() {
       }
       if (wifiReconnecting) {
         wifiReconnecting = false;
+        prevWifiStatusLine = "";
         Serial.println("WiFi YENİDEN BAGLANDI!");
         Serial.print("IP: ");
         Serial.println(WiFi.localIP());
@@ -2049,7 +3045,9 @@ void checkWiFiConnection() {
         
         // NTP'yi yeniden yapılandır (hızlı, blocking değil)
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
+        WiFi.setSleep(WIFI_PS_NONE);
+        configureWifiDns();
+        invalidateRegionalWeather();
         startOTA();
         
         // Önceki değerleri sıfırla ki ekran yeniden çizilsin
@@ -2105,11 +3103,11 @@ void handleRoot() {
   html += "<form action='/save' method='POST'>";
   html += "<div class='form-group'>";
   html += "<label for='ssid'>WiFi Ağ Adı (SSID):</label>";
-  html += "<input type='text' id='ssid' name='ssid' required placeholder='WiFi ağ adını girin'>";
+  html += "<input type='text' id='ssid' name='ssid' required placeholder='WiFi ag adi (zorunlu)'>";
   html += "</div>";
   html += "<div class='form-group'>";
   html += "<label for='pass'>WiFi Şifresi:</label>";
-  html += "<input type='password' id='pass' name='pass' required placeholder='WiFi şifresini girin'>";
+  html += "<input type='password' id='pass' name='pass' placeholder='Acik ag ise bos birakin'>";
   html += "</div>";
   html += "<button type='submit'>🔗 WiFi'ye Bağlan</button>";
   html += "</form>";
@@ -2118,10 +3116,19 @@ void handleRoot() {
 }
 
 void handleSave() {
-  if (server.hasArg("ssid") && server.hasArg("pass")) {
+  if (server.hasArg("ssid")) {
     String ssid = server.arg("ssid");
-    String pass = server.arg("pass");
-    
+    String pass = server.hasArg("pass") ? server.arg("pass") : "";
+    ssid.trim();
+    pass.trim();
+
+    if (ssid.length() == 0) {
+      server.send(400, "text/html; charset=utf-8",
+                  "<html><body><h1>Hata</h1><p>WiFi adi (SSID) bos olamaz.</p>"
+                  "<a href='/'>Geri</a></body></html>");
+      return;
+    }
+
     Serial.println("WiFi bilgileri alindi:");
     Serial.print("SSID: ");
     Serial.println(ssid);
@@ -2133,9 +3140,6 @@ void handleSave() {
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
     prefs.end();
-    
-    // WiFiManager'a da kaydet
-    wifiManager.setSTAStaticIPConfig(IPAddress(), IPAddress(), IPAddress());
     
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
@@ -2190,17 +3194,152 @@ void handleSave() {
 }
 
 // =======================================================
-// 🟦 WIFI MANAGER İLE BAĞLANTI
+// 🟦 WiFi kurulum AP (tek web sunucusu — port 80 cakismasi yok)
+// =======================================================
+void drawWifiSetupStatus(const char* status) {
+  tft.fillRect(0, 154, TFT_WIDTH, 14, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(4, 156);
+  tft.print(getText("Durum: ", "Status: "));
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.println(status);
+}
+
+void drawWifiSetupScreen() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(72, 4);
+  tft.println("WiFi");
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(4, 26);
+  tft.println(getText("1) Telefonda WiFi acin:", "1) On phone open WiFi:"));
+
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(8, 38);
+  tft.println(ap_ssid);
+  tft.setCursor(8, 50);
+  tft.print(getText("   sifre: ", "   pass: "));
+  tft.println(ap_password);
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(4, 64);
+  tft.println(getText("2) Tarayicida acin:", "2) In browser open:"));
+
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(8, 76);
+  tft.println("http://192.168.4.1");
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(4, 90);
+  tft.println(getText("3) Ev agi SSID + sifre", "3) Enter home SSID + pass"));
+  tft.setCursor(4, 102);
+  tft.println(getText("   (SSID bos birakmayin)", "   (do not leave SSID empty)"));
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(4, 116);
+  tft.println(getText("Kayit -> kart yeniden baslar", "Save -> device restarts"));
+
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(4, 130);
+  tft.println(getText("Encoder: ana sayfa (iptal)", "Encoder: home (cancel)"));
+
+  String apStatus = getText("AP acildi, telefon bekleniyor", "AP on, waiting for phone");
+  drawWifiSetupStatus(apStatus.c_str());
+}
+
+void sanitizeWifiPrefs() {
+  prefs.begin("wifi", false);
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("pass", "");
+  ssid.trim();
+  pass.trim();
+  if (ssid.length() == 0) {
+    prefs.clear();
+    Serial.println("WiFi prefs temizlendi (bos SSID)");
+  } else {
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+  }
+  prefs.end();
+}
+
+void exitWifiSetupMode() {
+  if (!wifiSetupMode) {
+    return;
+  }
+  wifiSetupMode = false;
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+
+  tft.fillScreen(ST77XX_BLACK);
+  drawMainDashboard();
+  lastTimeUpdate = 0;
+  lastBatteryRead = 0;
+  Serial.println("WiFi kurulumdan cikildi — ana sayfa");
+}
+
+void startWifiSetupPortal() {
+  if (wifiSetupMode) {
+    return;
+  }
+  wifiSetupMode = true;
+
+  Serial.println("========================================");
+  Serial.println("WiFi kurulum AP baslatiliyor...");
+  Serial.println("AP: " + String(ap_ssid) + "  sifre: " + String(ap_password));
+  Serial.println("http://192.168.4.1");
+  Serial.println("========================================");
+
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
+                    IPAddress(192, 168, 4, 1),
+                    IPAddress(255, 255, 255, 0));
+  if (!WiFi.softAP(ap_ssid, ap_password)) {
+    Serial.println("HATA: softAP acilamadi!");
+  }
+  delay(300);
+
+  drawWifiSetupScreen();
+
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  Serial.println("Web sunucusu hazir (port 80)");
+}
+
+void drawMainDashboard() {
+  resetMainPageCaches();
+  prevChargeStatus = "";
+  clearMainPageBatteryLabels();
+  drawBattery(true, false);
+  updateLogoByRSSI();
+  drawBottomStatusBar();
+  drawDHT11Data(true);
+}
+
+// =======================================================
+// 🟦 WIFI BAĞLANTISI
 // =======================================================
 void connectWiFiAndNTP() {
-  // Önce kayıtlı WiFi bilgilerini kontrol et
+  sanitizeWifiPrefs();
+
   prefs.begin("wifi", true);
   String savedSSID = prefs.getString("ssid", "");
   String savedPass = prefs.getString("pass", "");
   prefs.end();
-  
-  // Eğer kayıtlı WiFi bilgisi varsa dene
-  if (savedSSID.length() > 0 && savedPass.length() > 0) {
+  savedSSID.trim();
+
+  if (savedSSID.length() > 0) {
     Serial.print("Kayitli WiFi'ye baglaniliyor: ");
     Serial.println(savedSSID);
     
@@ -2224,8 +3363,10 @@ void connectWiFiAndNTP() {
       wifiConnectedTime = millis();
       wifiWasConnected = true;
       wifiSetupMode = false;
-      
-      // NTP yapılandırması
+      WiFi.setSleep(WIFI_PS_NONE);
+      configureWifiDns();
+      invalidateRegionalWeather();
+
       configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
       
       struct tm timeinfo;
@@ -2239,91 +3380,11 @@ void connectWiFiAndNTP() {
       return; // Başarılı, normal çalışmaya devam et
     }
     
-    Serial.println("\nBaglanamadi, WiFiManager aciliyor...");
-    // Bağlanamadı, AP moduna geç
+    Serial.println("\nWiFi baglanamadi — cevrimdisi ana sayfa");
   } else {
-    Serial.println("Kayitli WiFi bilgisi yok, WiFiManager aciliyor...");
+    Serial.println("Kayitli WiFi yok — cevrimdisi ana sayfa");
+    Serial.println("WiFi kur: Menu > WiFi Ayarlari");
   }
-  
-  // WiFi bilgisi yoksa veya bağlanamadıysa WiFiManager'ı başlat
-  wifiSetupMode = true;
-  
-  Serial.println("========================================");
-  Serial.println("WiFiManager AP Modu baslatiliyor...");
-  Serial.println("AP Ag Adi: " + String(ap_ssid));
-  Serial.println("AP Sifresi: " + String(ap_password));
-  Serial.println("AP IP: 192.168.4.1");
-  Serial.println("========================================");
-  
-  // WiFi'yi temizle
-  WiFi.disconnect();
-  delay(500);
-  
-  // Ekranda bilgilendirme göster
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(20, 20);
-  tft.println("WiFi AYARLARI");
-  
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 50);
-  tft.println("Ag adi:");
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(10, 65);
-  tft.println(ap_ssid);
-  
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 85);
-  tft.println("Sifre:");
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(10, 100);
-  tft.println(ap_password);
-  
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(10, 125);
-  tft.println("Telefonunuzdan baglanip");
-  tft.setCursor(10, 140);
-  tft.println("ayarlari yapiniz");
-  
-  tft.setTextColor(ST77XX_GREEN);
-  tft.setCursor(10, 158);
-  tft.println("192.168.4.1");
-  
-  // WiFiManager ayarları
-  wifiManager.setConfigPortalTimeout(180);  // 3 dakika timeout
-  wifiManager.setAPStaticIPConfig(IPAddress(192,168,4,1), 
-                                   IPAddress(192,168,4,1), 
-                                   IPAddress(255,255,255,0));
-  
-  // WiFi'yi açıkça AP moduna geçir
-  WiFi.mode(WIFI_AP_STA);  // Hem AP hem Station modu
-  
-  Serial.println("AP modu aciliyor...");
-  delay(1000);  // AP'nin açılması için bekleme
-  
-  // WiFiManager'ı non-blocking modda başlat
-  // startConfigPortal() web sunucusunu başlatır ama blocking değil
-  Serial.println("========================================");
-  Serial.println("WiFiManager web sunucusu baslatiliyor...");
-  Serial.println("Tarayicida http://192.168.4.1 adresini acin");
-  Serial.println("========================================");
-  
-  // startConfigPortal() web sunucusunu başlatır (non-blocking)
-  wifiManager.startConfigPortal(ap_ssid, ap_password);
-  
-  Serial.println("Web sunucusu baslatildi! http://192.168.4.1");
-  
-  // Web sunucusu route'larını ayarla
-  server.on("/", handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
-  server.begin();
-  Serial.println("Web sunucusu route'lari ayarlandi: / ve /save");
-  
-  // WiFi bağlantısı web arayüzünden yapılacak
-  // handleSave() fonksiyonu WiFi bilgilerini kaydedip ESP32'yi yeniden başlatacak
 }
 
 // =======================================================
@@ -2467,8 +3528,15 @@ void saveLanguage() {
 // =======================================================
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  
+  delay(400);
+  Serial.println();
+  Serial.println("=== ESP32-S3 Super Mini boot ===");
+  Serial.println(VERSION_TEXT);
+  printChipInfo();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, BUZZER_OFF);
+
   // Deep Sleep'ten uyanma sebebini kontrol et
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch(wakeup_reason) {
@@ -2491,53 +3559,30 @@ void setup() {
   
   // Dil tercihini yükle
   loadLanguage();
+
+  fetchLocationData();
   
   // Sistem başlangıç zamanını kaydet
   systemStartTime = millis();
 
-  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  printPinMap();
 
-  tft.init(TFT_HEIGHT, TFT_WIDTH);
-  tft.setRotation(1);
-  tft.fillScreen(ST77XX_BLACK);
+  initDisplay();
 
-  // DHT11 başlatma
+#if USE_DHT11
   dht.begin();
   Serial.println("DHT11 baslatildi!");
+#else
+  Serial.println("DHT11 kapali (GPIO2 = BL)");
+#endif
 
-  // Batarya ADC (GPIO0, voltaj bölücü)
   pinMode(BAT_ADC_PIN, INPUT);
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
-  Serial.println("Batarya olcumu baslatildi (GPIO0)");
+  Serial.println("Batarya olcumu baslatildi (GPIO1 / A0)");
 
-  // Backlight PWM başlatma
-  Serial.print("Backlight pin'i ayarlaniyor: GPIO");
-  Serial.println(TFT_BACKLIGHT);
-  Serial.print("PWM Frekans: ");
-  Serial.print(LEDC_FREQ);
-  Serial.print(" Hz, Cozunurluk: ");
-  Serial.print(LEDC_RESOLUTION);
-  Serial.println(" bit");
-  
-  // Pin'i OUTPUT olarak ayarla
-  pinMode(TFT_BACKLIGHT, OUTPUT);
-  digitalWrite(TFT_BACKLIGHT, LOW);  // Önce LOW
-  delay(10);
-  
-  if (USE_PWM) {
-    ledcSetup(BACKLIGHT_LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
-    ledcAttachPin(TFT_BACKLIGHT, BACKLIGHT_LEDC_CHANNEL);
-    delay(10);
-    Serial.println("PWM modu aktif - LEDC baslatildi");
-  } else {
-    // Digital modu (açık/kapalı)
-    Serial.println("Digital modu aktif (acik/kapali)");
-  }
-  
-  // Varsayılan parlaklığa ayarla
+  Serial.println("Buzzer baslatildi (GPIO11)");
+
   setBrightness(brightness);
-  
-  Serial.println("Backlight baslatildi!");
 
   // Encoder başlatma
   initEncoder();
@@ -2545,15 +3590,26 @@ void setup() {
   pinMode(PIN_CHRG, INPUT_PULLUP);
   pinMode(PIN_STDBY, INPUT_PULLUP);
 
+  initOnboardRgb();
+
   showSplashScreen();
   connectWiFiAndNTP();
 
-  drawVersionText();  // Açılışta da yazılsın
-  drawChargeStatus();
-  drawBattery(true);  // İlk batarya okuması
-  updateLogoByRSSI();
+  if (WiFi.status() == WL_CONNECTED) {
+    delay(2000);
+    fetchTemperatureData();
+  }
 
-  // OTA'yı sadece WiFi bağlıysa başlat (startOTA içinde de kontrol var ama burada da kontrol edelim)
+  prevDate = "";
+  prevTime = "";
+  drawMainDashboard();
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    drawTimeAndDate(timeinfo);
+  }
+  resetLeftInfoPanelCache();
+  drawDHT11Data();
+  drawBottomStatusBar();
   if (WiFi.status() == WL_CONNECTED) {
     startOTA();
   }
@@ -2564,56 +3620,29 @@ void setup() {
 
 // =======================================================
 void loop() {
-  // WiFiManager AP modunda çalışıyorsa handle et
   if (wifiSetupMode) {
-    wifiManager.process();  // WiFiManager isteklerini işle
-    server.handleClient();  // Web sunucusu isteklerini işle
-    
-    // WiFi bağlandı mı kontrol et
-    if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0) {
-      // WiFi bağlandı ama AP modu hala açık
-      // WiFiManager otomatik olarak kapatacak, biraz bekle
-      delay(1000);
-      
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("WiFi'ye baglanildi! AP modu kapatiliyor...");
-        wifiSetupMode = false;
-        
-        // WiFi bilgilerini kaydet
-        Preferences wmPrefs;
-        String wifiPass = "";
-        wmPrefs.begin("wifimanager", true);
-        wifiPass = wmPrefs.getString("pwd", "");
-        if (wifiPass.length() == 0) {
-          wifiPass = wmPrefs.getString("password", "");
-        }
-        wmPrefs.end();
-        
-        prefs.begin("wifi", false);
-        prefs.putString("ssid", WiFi.SSID());
-        if (wifiPass.length() > 0) {
-          prefs.putString("pass", wifiPass);
-        }
-        prefs.end();
-        
-        ipAddress = WiFi.localIP().toString();
-        wifiConnectedTime = millis();
-        wifiWasConnected = true;
-        
-        // NTP yapılandırması
-        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-        
-        // Ekranı temizle
-        tft.fillScreen(ST77XX_BLACK);
-        
-        // Web sunucusunu kapat
-        server.stop();
+    server.handleClient();
 
-        startOTA();
-      }
+    if (encoderButtonPressed) {
+      encoderButtonPressed = false;
+      exitWifiSetupMode();
+      return;
     }
-    
-    return;  // AP modundayken diğer işlemleri yapma
+
+    static unsigned long lastPulse = 0;
+    static uint8_t pulse = 0;
+    if (millis() - lastPulse >= 600) {
+      lastPulse = millis();
+      pulse = (pulse + 1) % 4;
+      String st = getText("telefon/baglanti", "phone/link");
+      for (uint8_t i = 0; i < pulse; i++) {
+        st += ".";
+      }
+      drawWifiSetupStatus(st.c_str());
+    }
+
+    updateOnboardRgb();
+    return;
   }
   
   // OTA — ekran koruyucudan once; upload sirasinda da dinlemeli
@@ -2626,10 +3655,11 @@ void loop() {
   checkScreenSaver();
   
   updateTimeIfNeeded();
-  handleEncoderNavigation();  // 🔥 ENCODER KONTROLÜ
-  checkWiFiConnection();      // 🔥 WIFI YENİDEN BAĞLANMA (Non-blocking, CPU dostu)
-  
-  // Toplam çalışma süresini belirli aralıklarla kaydet
+  updateRegionalWeather();
+  handleEncoderNavigation();
+  checkWiFiConnection();
+  updateOnboardRgb();
+
   unsigned long now = millis();
   if (now - lastUptimeSave >= uptimeSaveInterval) {
     lastUptimeSave = now;
